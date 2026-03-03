@@ -18,7 +18,10 @@ pub fn handle_events(app: &mut App) -> std::io::Result<bool> {
         match app.input_mode {
             InputMode::Normal => handle_normal_mode(app, key),
             InputMode::Search => handle_search_mode(app, key),
+            InputMode::Plan => handle_plan_mode(app, key),
             InputMode::ProviderPopup => handle_provider_popup_mode(app, key),
+            InputMode::UseCasePopup => handle_use_case_popup_mode(app, key),
+            InputMode::DownloadProviderPopup => handle_download_provider_popup_mode(app, key),
         }
         return Ok(true);
     }
@@ -52,25 +55,44 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
         // Fit filter
         KeyCode::Char('f') => app.cycle_fit_filter(),
 
+        // Availability filter
+        KeyCode::Char('a') => app.cycle_availability_filter(),
+
         // Sort column
         KeyCode::Char('s') => app.cycle_sort_column(),
 
         // Theme
         KeyCode::Char('t') => app.cycle_theme(),
 
+        // Plan view
+        KeyCode::Char('p') => app.open_plan_mode(),
+
         // Provider popup
-        KeyCode::Char('p') => app.open_provider_popup(),
+        KeyCode::Char('P') => app.open_provider_popup(),
+        KeyCode::Char('U') => app.open_use_case_popup(),
 
         // Installed-first sort toggle (any provider)
-        KeyCode::Char('i') if app.ollama_available || app.mlx_available => {
+        KeyCode::Char('i')
+            if app.ollama_available || app.mlx_available || app.llamacpp_available =>
+        {
             app.toggle_installed_first()
         }
 
-        // Download model via best provider
-        KeyCode::Char('d') if app.ollama_available || app.mlx_available => app.start_download(),
+        // Download model via best provider (requires confirmation)
+        KeyCode::Char('d')
+            if app.ollama_available || app.mlx_available || app.llamacpp_available =>
+        {
+            if app.pull_active.is_none() {
+                app.start_download();
+            }
+        }
 
         // Refresh installed models
-        KeyCode::Char('r') if app.ollama_available || app.mlx_available => app.refresh_installed(),
+        KeyCode::Char('r')
+            if app.ollama_available || app.mlx_available || app.llamacpp_available =>
+        {
+            app.refresh_installed()
+        }
 
         // Detail view
         KeyCode::Enter => app.toggle_detail(),
@@ -102,7 +124,7 @@ fn handle_search_mode(app: &mut App, key: KeyEvent) {
 
 fn handle_provider_popup_mode(app: &mut App, key: KeyEvent) {
     match key.code {
-        KeyCode::Esc | KeyCode::Char('p') | KeyCode::Char('q') => app.close_provider_popup(),
+        KeyCode::Esc | KeyCode::Char('P') | KeyCode::Char('q') => app.close_provider_popup(),
 
         KeyCode::Up | KeyCode::Char('k') => app.provider_popup_up(),
         KeyCode::Down | KeyCode::Char('j') => app.provider_popup_down(),
@@ -111,6 +133,48 @@ fn handle_provider_popup_mode(app: &mut App, key: KeyEvent) {
 
         KeyCode::Char('a') => app.provider_popup_select_all(),
 
+        _ => {}
+    }
+}
+
+fn handle_plan_mode(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => app.close_plan_mode(),
+        KeyCode::Tab | KeyCode::Down | KeyCode::Char('j') => app.plan_next_field(),
+        KeyCode::BackTab | KeyCode::Up | KeyCode::Char('k') => app.plan_prev_field(),
+        KeyCode::Left => app.plan_cursor_left(),
+        KeyCode::Right => app.plan_cursor_right(),
+        KeyCode::Backspace => app.plan_backspace(),
+        KeyCode::Delete => app.plan_delete(),
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.plan_clear_field()
+        }
+        KeyCode::Char(c) => app.plan_input(c),
+        _ => {}
+    }
+}
+
+fn handle_use_case_popup_mode(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('U') | KeyCode::Char('q') => app.close_use_case_popup(),
+
+        KeyCode::Up | KeyCode::Char('k') => app.use_case_popup_up(),
+        KeyCode::Down | KeyCode::Char('j') => app.use_case_popup_down(),
+
+        KeyCode::Char(' ') | KeyCode::Enter => app.use_case_popup_toggle(),
+
+        KeyCode::Char('a') => app.use_case_popup_select_all(),
+
+        _ => {}
+    }
+}
+
+fn handle_download_provider_popup_mode(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => app.close_download_provider_popup(),
+        KeyCode::Up | KeyCode::Char('k') => app.download_provider_popup_up(),
+        KeyCode::Down | KeyCode::Char('j') => app.download_provider_popup_down(),
+        KeyCode::Enter | KeyCode::Char(' ') => app.confirm_download_provider_selection(),
         _ => {}
     }
 }

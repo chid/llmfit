@@ -11,6 +11,7 @@ pub enum GpuBackend {
     Sycl,   // Intel oneAPI
     CpuArm,
     CpuX86,
+    Ascend,
 }
 
 impl GpuBackend {
@@ -23,6 +24,7 @@ impl GpuBackend {
             GpuBackend::Sycl => "SYCL",
             GpuBackend::CpuArm => "CPU (ARM)",
             GpuBackend::CpuX86 => "CPU (x86)",
+            GpuBackend::Ascend => "NPU (Ascend)",
         }
     }
 }
@@ -80,7 +82,7 @@ impl SystemSpecs {
             .map(|cpu| cpu.brand().to_string())
             .unwrap_or_else(|| "Unknown CPU".to_string());
 
-        let gpus = Self::detect_all_gpus(available_ram_gb, &cpu_name);
+        let gpus = Self::detect_all_gpus(total_ram_gb, &cpu_name);
 
         // Primary GPU = the one with the most VRAM (best for inference).
         // For fit scoring, we use the primary GPU's VRAM pool.
@@ -120,7 +122,7 @@ impl SystemSpecs {
     /// Detect all GPUs across all vendors. Returns a Vec sorted by VRAM descending
     /// (best GPU first). Unlike the old cascade, this does NOT short-circuit:
     /// a system with both NVIDIA and AMD GPUs will report both.
-    fn detect_all_gpus(available_ram_gb: f64, cpu_name: &str) -> Vec<GpuInfo> {
+    fn detect_all_gpus(total_ram_gb: f64, cpu_name: &str) -> Vec<GpuInfo> {
         let mut gpus = Vec::new();
 
         // NVIDIA GPUs via nvidia-smi, with sysfs fallback for Linux/toolbox setups
@@ -153,6 +155,48 @@ impl SystemSpecs {
             }
         }
 
+        // AMD unified memory APUs (e.g. Ryzen AI MAX series).
+        // These share the full system RAM between CPU and GPU, like Apple Silicon.
+        // WMI AdapterRAM is a 32-bit field capped at ~4 GB, so we override with
+        // total system RAM for these APUs.
+        if is_amd_unified_memory_apu(cpu_name) {
+            let amd_idx = gpus.iter().position(|g| {
+                let lower = g.name.to_lowercase();
+                lower.contains("amd") || lower.contains("radeon")
+            });
+            if let Some(idx) = amd_idx {
+                gpus[idx].unified_memory = true;
+                gpus[idx].vram_gb = Some(total_ram_gb);
+            } else {
+                // No AMD GPU found via other methods; create one.
+                gpus.push(GpuInfo {
+                    name: format!("{} (integrated)", cpu_name),
+                    vram_gb: Some(total_ram_gb),
+                    backend: GpuBackend::Vulkan,
+                    count: 1,
+                    unified_memory: true,
+                });
+            }
+        }
+
+        // NVIDIA Grace / DGX Spark unified memory SoCs (e.g. GB10, GB20).
+        // These share the full system RAM between CPU and GPU, like Apple Silicon.
+        // nvidia-smi may report 0 VRAM or a small dedicated portion, so we
+        // override with total system RAM and flag as unified memory.
+        let is_nvidia_unified = gpus.iter().any(|g| {
+            let lower = g.name.to_lowercase();
+            lower.contains("gb10") || lower.contains("gb20")
+        });
+        if is_nvidia_unified {
+            for gpu in &mut gpus {
+                let lower = gpu.name.to_lowercase();
+                if lower.contains("gb10") || lower.contains("gb20") {
+                    gpu.unified_memory = true;
+                    gpu.vram_gb = Some(total_ram_gb);
+                }
+            }
+        }
+
         // Intel Arc via sysfs
         if let Some(vram) = Self::detect_intel_gpu() {
             let already_found = gpus.iter().any(|g| g.name.to_lowercase().contains("intel"));
@@ -168,7 +212,7 @@ impl SystemSpecs {
         }
 
         // Apple Silicon (unified memory)
-        if let Some(vram) = Self::detect_apple_gpu(available_ram_gb) {
+        if let Some(vram) = Self::detect_apple_gpu(total_ram_gb) {
             let name = if cpu_name.to_lowercase().contains("apple") {
                 cpu_name.to_string()
             } else {
@@ -183,6 +227,12 @@ impl SystemSpecs {
             });
         }
 
+        // Ascend NPUs via npu-smi
+        let ascend = Self::detect_ascend_npus();
+        if !ascend.is_empty() {
+            gpus.extend(ascend);
+        }
+
         // Sort by VRAM descending so the best GPU is primary
         gpus.sort_by(|a, b| {
             let va = a.vram_gb.unwrap_or(0.0);
@@ -195,7 +245,19 @@ impl SystemSpecs {
 
     /// Detect NVIDIA GPUs via nvidia-smi. Returns one GpuInfo per unique model,
     /// with count and per-card VRAM for same-model multi-GPU setups.
+    ///
+    /// First tries querying `addressing_mode` to detect unified memory (Tegra/Grace
+    /// Blackwell platforms). Falls back to the standard 2-column query if the field
+    /// is unavailable on older nvidia-smi versions.
     fn detect_nvidia_gpus() -> Vec<GpuInfo> {
+        // Try the extended query first (addressing_mode,memory.total,name).
+        // On NVIDIA Tegra / Grace Blackwell, addressing_mode returns "ATS"
+        // (Address Translation Services) which signals unified CPU+GPU memory.
+        if let Some(gpus) = Self::try_nvidia_smi_with_addressing_mode() {
+            return gpus;
+        }
+
+        // Fallback: standard 2-column query for older nvidia-smi versions
         let output = match std::process::Command::new("nvidia-smi")
             .arg("--query-gpu=memory.total,name")
             .arg("--format=csv,noheader,nounits")
@@ -211,6 +273,94 @@ impl SystemSpecs {
         };
 
         Self::parse_nvidia_smi_list(&text)
+    }
+
+    /// Try nvidia-smi with `addressing_mode` column. Returns `None` if the
+    /// query fails (e.g. older driver that doesn't support the field), so the
+    /// caller can fall back to the standard query.
+    fn try_nvidia_smi_with_addressing_mode() -> Option<Vec<GpuInfo>> {
+        let output = std::process::Command::new("nvidia-smi")
+            .arg("--query-gpu=addressing_mode,memory.total,name")
+            .arg("--format=csv,noheader,nounits")
+            .output()
+            .ok()?;
+
+        if !output.status.success() {
+            return None;
+        }
+
+        let text = String::from_utf8(output.stdout).ok()?;
+        Some(Self::parse_nvidia_smi_extended(&text))
+    }
+
+    /// Parse `nvidia-smi --query-gpu=addressing_mode,memory.total,name`.
+    /// Detects unified memory when addressing_mode is "ATS" and VRAM is
+    /// unavailable — common on NVIDIA Tegra / Grace Blackwell (DGX Spark).
+    /// Falls back to system RAM via /proc/meminfo as the unified memory pool.
+    fn parse_nvidia_smi_extended(text: &str) -> Vec<GpuInfo> {
+        // Track per-model: (count, per_card_vram_mb, is_unified)
+        let mut grouped: BTreeMap<String, (u32, f64, bool)> = BTreeMap::new();
+        let total_ram_gb = read_proc_meminfo_total_gb();
+
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let parts: Vec<&str> = line.splitn(3, ',').collect();
+            if parts.len() < 3 {
+                continue;
+            }
+
+            let addr_mode = parts[0].trim();
+            let is_unified = addr_mode.eq_ignore_ascii_case("ATS");
+
+            let name = parts[2].trim().to_string();
+            let name = if name.is_empty() {
+                "NVIDIA GPU".to_string()
+            } else {
+                name
+            };
+
+            let parsed_vram_mb = parts[1].trim().parse::<f64>().unwrap_or(0.0);
+
+            let vram_mb = if parsed_vram_mb > 0.0 {
+                parsed_vram_mb
+            } else if is_unified {
+                // Unified memory: use total system RAM as the shared pool
+                total_ram_gb.unwrap_or(0.0) * 1024.0
+            } else {
+                estimate_vram_from_name(&name) * 1024.0
+            };
+
+            let entry = grouped.entry(name).or_insert((0, 0.0, false));
+            entry.0 += 1;
+            if vram_mb > entry.1 {
+                entry.1 = vram_mb;
+            }
+            if is_unified {
+                entry.2 = true;
+            }
+        }
+
+        if grouped.is_empty() {
+            return Vec::new();
+        }
+
+        grouped
+            .into_iter()
+            .map(|(name, (count, per_card_vram_mb, is_unified))| GpuInfo {
+                name,
+                vram_gb: if per_card_vram_mb > 0.0 {
+                    Some(per_card_vram_mb / 1024.0)
+                } else {
+                    None
+                },
+                backend: GpuBackend::Cuda,
+                count,
+                unified_memory: is_unified,
+            })
+            .collect()
     }
 
     /// Parse `nvidia-smi --query-gpu=memory.total,name --format=csv,noheader,nounits`.
@@ -848,6 +998,66 @@ impl SystemSpecs {
         }
     }
 
+    /// Detect Ascend NPUs via npu-smi. Returns a vector of NPU info.
+    fn detect_ascend_npus() -> Vec<GpuInfo> {
+        // 1. Get the list of IDs
+        let list_output = match std::process::Command::new("npu-smi")
+            .args(["info", "-l"])
+            .output()
+        {
+            Ok(o) if o.status.success() => o,
+            _ => return Vec::new(),
+        };
+
+        let list_stdout = String::from_utf8_lossy(&list_output.stdout);
+
+        // Extracting IDs: ["0", "1", "2"...]
+        let ids: Vec<String> = list_stdout
+            .lines()
+            .filter(|line| line.contains("NPU ID"))
+            .filter_map(|line| line.split(':').last())
+            .map(|s| s.trim().to_string())
+            .collect();
+
+        if ids.is_empty() {
+            return Vec::new();
+        }
+
+        let mut npu_infos: Vec<GpuInfo> = Vec::new();
+        let npu_name = "Ascend NPU";
+
+        // 2. Loop through NPUs
+        for id in &ids {
+            let mem_output = std::process::Command::new("npu-smi")
+                .args(["info", "-t", "memory", "-i", id])
+                .output();
+
+            if let Ok(o) = mem_output {
+                let s = String::from_utf8_lossy(&o.stdout);
+
+                // Parse HBM Capacity (e.g., from "HBM Capacity(MB) : 65536")
+                let mem = s
+                    .lines()
+                    .find(|l| l.contains("HBM Capacity"))
+                    .and_then(|l| l.split(':').last())
+                    .and_then(|v| v.trim().split_whitespace().next())
+                    .and_then(|num| num.parse::<u64>().ok())
+                    .unwrap_or(0);
+
+                let npu_info = GpuInfo {
+                    name: npu_name.to_string(),
+                    vram_gb: Some((mem as f64) / 1024.0),
+                    backend: GpuBackend::Ascend,
+                    count: 1,
+                    unified_memory: false,
+                };
+                npu_infos.push(npu_info);
+            }
+        }
+
+        return npu_infos;
+    }
+
     /// Fallback for available RAM when sysinfo returns 0.
     /// Tries total - used first, then macOS vm_stat parsing.
     fn available_ram_fallback(sys: &System, total_bytes: u64, total_gb: f64) -> f64 {
@@ -946,6 +1156,7 @@ impl SystemSpecs {
             });
             self.has_gpu = true;
             self.gpu_vram_gb = Some(vram_gb);
+            self.total_gpu_vram_gb = Some(vram_gb);
             self.gpu_name = Some("User-specified GPU".to_string());
             self.gpu_count = 1;
             self.backend = backend;
@@ -953,6 +1164,9 @@ impl SystemSpecs {
             // Override the primary (first) GPU's VRAM.
             self.gpus[0].vram_gb = Some(vram_gb);
             self.gpu_vram_gb = Some(vram_gb);
+            // Update total VRAM: per-card VRAM * count.
+            let count = self.gpus[0].count;
+            self.total_gpu_vram_gb = Some(vram_gb * count as f64);
             self.has_gpu = true;
         }
         self
@@ -1077,6 +1291,349 @@ fn detect_running_in_wsl() -> bool {
         })
 }
 
+/// Check if the CPU name indicates an AMD APU with unified memory architecture.
+/// These APUs share the full system RAM between CPU and GPU (like Apple Silicon).
+/// Currently covers:
+///  - Ryzen AI MAX / MAX+ (Strix Halo): up to 128 GB unified.
+///  - Ryzen AI 9 / 7 / 5 (Strix Point, Krackan Point): configurable shared
+///    memory, users can allocate most of system RAM to GPU via BIOS.
+/// All Ryzen AI APUs have integrated Radeon GPUs that share system memory.
+fn is_amd_unified_memory_apu(cpu_name: &str) -> bool {
+    let lower = cpu_name.to_lowercase();
+    // All "Ryzen AI" branded APUs use unified/shared memory.
+    // Examples:
+    //   "AMD Ryzen AI MAX+ 395 w/ Radeon 8060S"
+    //   "AMD Ryzen AI 9 HX 370 w/ Radeon 890M"
+    //   "AMD Ryzen AI 7 350"
+    if lower.contains("ryzen ai") {
+        return true;
+    }
+    false
+}
+
+/// Read total system RAM from /proc/meminfo (Linux only).
+/// Used as the unified memory pool on NVIDIA Tegra / Grace Blackwell platforms
+/// where nvidia-smi cannot report dedicated VRAM.
+fn read_proc_meminfo_total_gb() -> Option<f64> {
+    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("MemTotal:") {
+            let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
+            return Some(kb as f64 / (1024.0 * 1024.0));
+        }
+    }
+    None
+}
+
+/// Estimate GPU memory bandwidth in GB/s from the GPU model name.
+///
+/// Token generation in LLM inference is memory-bandwidth-bound (each token
+/// requires reading the full model weights once). Using per-GPU bandwidth
+/// produces significantly more accurate tok/s estimates than a single
+/// constant for all CUDA/ROCm/Metal devices.
+///
+/// References:
+///  - kipply, "Transformer Inference Arithmetic" (2022)
+///  - ggerganov, llama.cpp Apple Silicon benchmarks (Discussion #4167)
+///  - Google, "Efficiently Scaling Transformer Inference" (arXiv:2211.05102)
+///  - ggerganov, llama.cpp NVIDIA T4 benchmarks (Discussion #4225)
+///
+/// Returns `None` when the GPU is not recognized; callers should fall back
+/// to the existing fixed-constant approach.
+pub fn gpu_memory_bandwidth_gbps(name: &str) -> Option<f64> {
+    let lower = name.to_lowercase();
+
+    // ── NVIDIA Consumer (GeForce) ──────────────────────────────────
+    // RTX 50 series (Blackwell)
+    if lower.contains("5090") {
+        return Some(1792.0);
+    }
+    if lower.contains("5080") {
+        return Some(960.0);
+    }
+    if lower.contains("5070 ti") {
+        return Some(896.0);
+    }
+    if lower.contains("5070") {
+        return Some(672.0);
+    }
+    if lower.contains("5060 ti") {
+        return Some(448.0);
+    }
+    if lower.contains("5060") {
+        return Some(256.0);
+    }
+
+    // RTX 40 series (Ada Lovelace)
+    if lower.contains("4090") {
+        return Some(1008.0);
+    }
+    if lower.contains("4080 super") {
+        return Some(736.0);
+    }
+    if lower.contains("4080") {
+        return Some(717.0);
+    }
+    if lower.contains("4070 ti super") {
+        return Some(672.0);
+    }
+    if lower.contains("4070 ti") {
+        return Some(504.0);
+    }
+    if lower.contains("4070 super") {
+        return Some(504.0);
+    }
+    if lower.contains("4070") {
+        return Some(504.0);
+    }
+    if lower.contains("4060 ti") {
+        return Some(288.0);
+    }
+    if lower.contains("4060") {
+        return Some(272.0);
+    }
+
+    // RTX 30 series (Ampere)
+    if lower.contains("3090 ti") {
+        return Some(1008.0);
+    }
+    if lower.contains("3090") {
+        return Some(936.0);
+    }
+    if lower.contains("3080 ti") {
+        return Some(912.0);
+    }
+    if lower.contains("3080") {
+        return Some(760.0);
+    }
+    if lower.contains("3070 ti") {
+        return Some(608.0);
+    }
+    if lower.contains("3070") {
+        return Some(448.0);
+    }
+    if lower.contains("3060 ti") {
+        return Some(448.0);
+    }
+    if lower.contains("3060") {
+        return Some(360.0);
+    }
+
+    // RTX 20 series (Turing)
+    if lower.contains("2080 ti") {
+        return Some(616.0);
+    }
+    if lower.contains("2080 super") {
+        return Some(496.0);
+    }
+    if lower.contains("2080") {
+        return Some(448.0);
+    }
+    if lower.contains("2070 super") {
+        return Some(448.0);
+    }
+    if lower.contains("2070") {
+        return Some(448.0);
+    }
+    if lower.contains("2060 super") {
+        return Some(448.0);
+    }
+    if lower.contains("2060") {
+        return Some(336.0);
+    }
+
+    // GTX 16 series (Turing, no RT cores)
+    if lower.contains("1660 ti") {
+        return Some(288.0);
+    }
+    if lower.contains("1660 super") {
+        return Some(336.0);
+    }
+    if lower.contains("1660") {
+        return Some(192.0);
+    }
+    if lower.contains("1650 super") {
+        return Some(192.0);
+    }
+    if lower.contains("1650") {
+        return Some(128.0);
+    }
+
+    // ── NVIDIA Data Center / Professional ──────────────────────────
+    if lower.contains("h100 sxm") {
+        return Some(3350.0);
+    }
+    if lower.contains("h100") {
+        return Some(2039.0);
+    } // PCIe
+    if lower.contains("h200") {
+        return Some(4800.0);
+    }
+    if lower.contains("a100 sxm") {
+        return Some(2039.0);
+    }
+    if lower.contains("a100") {
+        return Some(1555.0);
+    } // PCIe 40GB
+    if lower.contains("l40s") {
+        return Some(864.0);
+    }
+    if lower.contains("l40") {
+        return Some(864.0);
+    }
+    if lower.contains("l4") {
+        return Some(300.0);
+    }
+    if lower.contains("a10g") {
+        return Some(600.0);
+    }
+    if lower.contains("a10") {
+        return Some(600.0);
+    }
+    if lower.contains("t4") {
+        return Some(320.0);
+    }
+    if lower.contains("v100 sxm") {
+        return Some(900.0);
+    }
+    if lower.contains("v100") {
+        return Some(897.0);
+    }
+    if lower.contains("a6000") {
+        return Some(768.0);
+    }
+    if lower.contains("a5000") {
+        return Some(768.0);
+    }
+    if lower.contains("a4000") {
+        return Some(448.0);
+    }
+
+    // ── AMD Discrete (RDNA) ────────────────────────────────────────
+    // RX 9000 series (RDNA 4)
+    if lower.contains("9070 xt") {
+        return Some(624.0);
+    }
+    if lower.contains("9070") {
+        return Some(488.0);
+    }
+
+    // RX 7000 series (RDNA 3)
+    if lower.contains("7900 xtx") {
+        return Some(960.0);
+    }
+    if lower.contains("7900 xt") {
+        return Some(800.0);
+    }
+    if lower.contains("7900 gre") {
+        return Some(576.0);
+    }
+    if lower.contains("7800 xt") {
+        return Some(624.0);
+    }
+    if lower.contains("7700 xt") {
+        return Some(432.0);
+    }
+    if lower.contains("7600") {
+        return Some(288.0);
+    }
+
+    // RX 6000 series (RDNA 2)
+    if lower.contains("6950 xt") {
+        return Some(576.0);
+    }
+    if lower.contains("6900 xt") {
+        return Some(512.0);
+    }
+    if lower.contains("6800 xt") {
+        return Some(512.0);
+    }
+    if lower.contains("6800") {
+        return Some(512.0);
+    }
+    if lower.contains("6700 xt") {
+        return Some(384.0);
+    }
+    if lower.contains("6600 xt") {
+        return Some(256.0);
+    }
+    if lower.contains("6600") {
+        return Some(224.0);
+    }
+
+    // AMD data center (CDNA)
+    if lower.contains("mi300x") {
+        return Some(5300.0);
+    }
+    if lower.contains("mi300") {
+        return Some(5300.0);
+    }
+    if lower.contains("mi250x") {
+        return Some(3277.0);
+    }
+    if lower.contains("mi250") {
+        return Some(3277.0);
+    }
+    if lower.contains("mi210") {
+        return Some(1638.0);
+    }
+    if lower.contains("mi100") {
+        return Some(1229.0);
+    }
+
+    // ── Apple Silicon (unified memory bandwidth) ───────────────────
+    if lower.contains("m4 ultra") {
+        return Some(819.0);
+    }
+    if lower.contains("m4 max") {
+        return Some(546.0);
+    }
+    if lower.contains("m4 pro") {
+        return Some(273.0);
+    }
+    if lower.contains("m4") {
+        return Some(120.0);
+    }
+    if lower.contains("m3 ultra") {
+        return Some(800.0);
+    }
+    if lower.contains("m3 max") {
+        return Some(400.0);
+    }
+    if lower.contains("m3 pro") {
+        return Some(150.0);
+    }
+    if lower.contains("m3") {
+        return Some(100.0);
+    }
+    if lower.contains("m2 ultra") {
+        return Some(800.0);
+    }
+    if lower.contains("m2 max") {
+        return Some(400.0);
+    }
+    if lower.contains("m2 pro") {
+        return Some(200.0);
+    }
+    if lower.contains("m2") {
+        return Some(100.0);
+    }
+    if lower.contains("m1 ultra") {
+        return Some(800.0);
+    }
+    if lower.contains("m1 max") {
+        return Some(400.0);
+    }
+    if lower.contains("m1 pro") {
+        return Some(200.0);
+    }
+    if lower.contains("m1") {
+        return Some(68.0);
+    }
+
+    None
+}
+
 /// Fallback VRAM estimation from GPU model name.
 /// Used when nvidia-smi or other tools report 0 VRAM.
 fn estimate_vram_from_name(name: &str) -> f64 {
@@ -1154,6 +1711,13 @@ fn estimate_vram_from_name(name: &str) -> f64 {
     if lower.contains("t4") {
         return 16.0;
     }
+    // NVIDIA Grace / DGX Spark unified memory SoCs
+    if lower.contains("gb10") {
+        return 128.0;
+    }
+    if lower.contains("gb20") {
+        return 128.0;
+    }
     // AMD RX 9000 series (RDNA 4)
     if lower.contains("9070 xt") {
         return 16.0;
@@ -1221,6 +1785,35 @@ fn estimate_vram_from_name(name: &str) -> f64 {
     if lower.contains("5500") {
         return 4.0;
     }
+    // AMD Radeon 8000 series (Ryzen AI MAX / Strix Halo integrated)
+    // These are unified memory APUs; VRAM = system RAM in practice,
+    // but this fallback gives a reasonable discrete estimate for name-only detection.
+    if lower.contains("8060s") {
+        return 32.0;
+    }
+    if lower.contains("8050s") {
+        return 24.0;
+    }
+    if lower.contains("8060") && !lower.contains("8060s") {
+        return 16.0;
+    }
+    if lower.contains("8050") && !lower.contains("8050s") {
+        return 12.0;
+    }
+    // AMD Radeon 800M series (Ryzen AI 9 / Strix Point integrated)
+    if lower.contains("890m") {
+        return 16.0;
+    }
+    if lower.contains("880m") {
+        return 12.0;
+    }
+    if lower.contains("870m") {
+        return 8.0;
+    }
+    if lower.contains("860m") {
+        return 8.0;
+    }
+
     // Integrated GPUs (APU iGPUs) — must check before generic fallbacks
     // APU names like "AMD Radeon(TM) Graphics" or "Radeon Graphics" without
     // a discrete model number (RX/HD/R5/R7/R9) have very limited dedicated VRAM.
@@ -1230,6 +1823,8 @@ fn estimate_vram_from_name(name: &str) -> f64 {
         && !lower.contains(" r5 ")
         && !lower.contains(" r7 ")
         && !lower.contains(" r9 ")
+        && !lower.contains("8060")
+        && !lower.contains("8050")
         && (lower.contains("graphics") || lower.contains("igpu"))
     {
         return 0.5;
@@ -1274,5 +1869,118 @@ mod tests {
         assert_eq!(gpus.len(), 2);
         assert!(gpus.iter().any(|g| g.name.contains("4090") && g.count == 1));
         assert!(gpus.iter().any(|g| g.name.contains("4080") && g.count == 1));
+    }
+
+    #[test]
+    fn test_parse_nvidia_smi_gb10_gets_vram_estimate() {
+        // DGX Spark reports GB10 with 0 VRAM from nvidia-smi
+        let text = "0, NVIDIA GB10\n";
+        let gpus = SystemSpecs::parse_nvidia_smi_list(text);
+
+        assert_eq!(gpus.len(), 1);
+        assert!(gpus[0].name.contains("GB10"));
+        // estimate_vram_from_name should kick in and return 128GB
+        let vram = gpus[0].vram_gb.expect("GB10 should have estimated VRAM");
+        assert!(vram > 100.0, "GB10 VRAM should be ~128GB, got {vram}");
+    }
+
+    #[test]
+    fn test_estimate_vram_gb10() {
+        assert_eq!(super::estimate_vram_from_name("NVIDIA GB10"), 128.0);
+        assert_eq!(super::estimate_vram_from_name("NVIDIA GB20"), 128.0);
+    }
+
+    #[test]
+    fn test_parse_extended_discrete_gpu_not_unified() {
+        // Discrete GPU: addressing_mode is "None", VRAM is reported normally
+        let text = "None, 24564, NVIDIA GeForce RTX 4090\n";
+        let gpus = SystemSpecs::parse_nvidia_smi_extended(text);
+
+        assert_eq!(gpus.len(), 1);
+        assert_eq!(gpus[0].name, "NVIDIA GeForce RTX 4090");
+        assert!(
+            !gpus[0].unified_memory,
+            "discrete GPU should not be unified"
+        );
+        let vram = gpus[0].vram_gb.expect("VRAM should be present");
+        assert!(vram > 23.0 && vram < 25.0, "unexpected VRAM: {vram}");
+    }
+
+    #[test]
+    fn test_parse_extended_tegra_unified_memory() {
+        // NVIDIA Tegra / Grace Blackwell: ATS addressing, VRAM is [N/A]
+        // On a real system, /proc/meminfo would provide the fallback.
+        // In tests, /proc/meminfo may or may not exist.
+        let text = "ATS, [N/A], NVIDIA Thor\n";
+        let gpus = SystemSpecs::parse_nvidia_smi_extended(text);
+
+        assert_eq!(gpus.len(), 1);
+        assert_eq!(gpus[0].name, "NVIDIA Thor");
+        assert!(gpus[0].unified_memory, "ATS should set unified_memory=true");
+        // VRAM comes from /proc/meminfo; if unavailable, it's None
+        // (on Linux test machines it will be Some, on macOS CI it will be None)
+    }
+
+    #[test]
+    fn test_parse_extended_multi_gpu_discrete() {
+        // Two discrete GPUs, no unified memory
+        let text = "None, 24564, NVIDIA GeForce RTX 4090\nNone, 24564, NVIDIA GeForce RTX 4090\n";
+        let gpus = SystemSpecs::parse_nvidia_smi_extended(text);
+
+        assert_eq!(gpus.len(), 1);
+        assert_eq!(gpus[0].count, 2);
+        assert!(!gpus[0].unified_memory);
+    }
+
+    #[test]
+    fn test_gpu_bandwidth_known_gpus() {
+        // Spot-check a few well-known GPUs
+        assert_eq!(
+            super::gpu_memory_bandwidth_gbps("NVIDIA GeForce RTX 4090"),
+            Some(1008.0)
+        );
+        assert_eq!(
+            super::gpu_memory_bandwidth_gbps("NVIDIA GeForce RTX 3060"),
+            Some(360.0)
+        );
+        assert_eq!(super::gpu_memory_bandwidth_gbps("Tesla T4"), Some(320.0));
+        assert_eq!(
+            super::gpu_memory_bandwidth_gbps("NVIDIA H100 SXM"),
+            Some(3350.0)
+        );
+        assert_eq!(
+            super::gpu_memory_bandwidth_gbps("NVIDIA A100"),
+            Some(1555.0)
+        );
+    }
+
+    #[test]
+    fn test_gpu_bandwidth_apple_silicon() {
+        assert_eq!(
+            super::gpu_memory_bandwidth_gbps("Apple M1 Max"),
+            Some(400.0)
+        );
+        assert_eq!(
+            super::gpu_memory_bandwidth_gbps("Apple M4 Pro"),
+            Some(273.0)
+        );
+    }
+
+    #[test]
+    fn test_gpu_bandwidth_unknown_returns_none() {
+        assert_eq!(super::gpu_memory_bandwidth_gbps("Some Random GPU"), None);
+        assert_eq!(super::gpu_memory_bandwidth_gbps(""), None);
+    }
+
+    #[test]
+    fn test_gpu_bandwidth_amd() {
+        assert_eq!(
+            super::gpu_memory_bandwidth_gbps("AMD Radeon RX 7900 XTX"),
+            Some(960.0)
+        );
+        assert_eq!(
+            super::gpu_memory_bandwidth_gbps("AMD Instinct MI300X"),
+            Some(5300.0)
+        );
     }
 }

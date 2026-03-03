@@ -5,9 +5,10 @@ mod tui_events;
 mod tui_ui;
 
 use clap::{Parser, Subcommand};
-use llmfit_core::fit::ModelFit;
+use llmfit_core::fit::{ModelFit, backend_compatible};
 use llmfit_core::hardware::SystemSpecs;
 use llmfit_core::models::ModelDatabase;
+use llmfit_core::plan::{PlanRequest, estimate_model_plan, resolve_model_selector};
 
 #[derive(Parser)]
 #[command(name = "llmfit")]
@@ -30,13 +31,18 @@ struct Cli {
     cli: bool,
 
     /// Output results as JSON (for tool integration)
-    #[arg(long)]
+    #[arg(long, global = true)]
     json: bool,
 
     /// Override GPU VRAM size (e.g. "32G", "32000M", "1.5T").
     /// Useful when GPU memory autodetection fails.
     #[arg(long, value_name = "SIZE")]
     memory: Option<String>,
+
+    /// Cap context length used for memory estimation (tokens).
+    /// Falls back to OLLAMA_CONTEXT_LENGTH if not set.
+    #[arg(long, value_name = "TOKENS", value_parser = clap::value_parser!(u32).range(1..))]
+    max_context: Option<u32>,
 }
 
 #[derive(Subcommand)]
@@ -70,6 +76,24 @@ enum Commands {
         model: String,
     },
 
+    /// Plan hardware requirements for a specific model configuration
+    Plan {
+        /// Model selector (name or unique partial name)
+        model: String,
+
+        /// Context length for estimation (tokens)
+        #[arg(long, value_name = "TOKENS", value_parser = clap::value_parser!(u32).range(1..))]
+        context: u32,
+
+        /// Quantization override (e.g. Q4_K_M, Q8_0, mlx-4bit)
+        #[arg(long)]
+        quant: Option<String>,
+
+        /// Target decode speed in tokens/sec
+        #[arg(long, value_name = "TOK_S")]
+        target_tps: Option<f64>,
+    },
+
     /// Recommend top models for your hardware (JSON-friendly)
     Recommend {
         /// Limit number of recommendations
@@ -92,6 +116,60 @@ enum Commands {
         #[arg(long, default_value = "true")]
         json: bool,
     },
+
+    /// Download a GGUF model from HuggingFace for use with llama.cpp
+    Download {
+        /// Model to download. Can be:
+        ///   - HuggingFace repo (e.g. "bartowski/Llama-3.1-8B-Instruct-GGUF")
+        ///   - Search query (e.g. "llama 8b")
+        ///   - Known model name (e.g. "llama-3.1-8b-instruct")
+        model: String,
+
+        /// Specific GGUF quantization to download (e.g. "Q4_K_M", "Q8_0").
+        /// If omitted, selects the best quantization that fits your hardware.
+        #[arg(short, long)]
+        quant: Option<String>,
+
+        /// Maximum memory budget in GB for quantization selection
+        #[arg(long, value_name = "GB")]
+        budget: Option<f64>,
+
+        /// List available GGUF files in the repo without downloading
+        #[arg(long)]
+        list: bool,
+    },
+
+    /// Search HuggingFace for GGUF models compatible with llama.cpp
+    HfSearch {
+        /// Search query (model name, architecture, etc.)
+        query: String,
+
+        /// Maximum number of results
+        #[arg(short = 'n', long, default_value = "10")]
+        limit: usize,
+    },
+
+    /// Run a downloaded GGUF model with llama-cli or llama-server
+    Run {
+        /// Model file or name to run. If a name is given, searches the local cache.
+        model: String,
+
+        /// Run as an OpenAI-compatible API server instead of interactive chat
+        #[arg(long)]
+        server: bool,
+
+        /// Port for the API server (default: 8080)
+        #[arg(long, default_value = "8080")]
+        port: u16,
+
+        /// Number of GPU layers to offload (-1 = all)
+        #[arg(long, short = 'g', default_value = "-1")]
+        ngl: i32,
+
+        /// Context size in tokens
+        #[arg(long, short = 'c', default_value = "4096")]
+        ctx_size: u32,
+    },
 }
 
 /// Detect system specs with optional GPU memory override.
@@ -113,7 +191,33 @@ fn detect_specs(memory_override: &Option<String>) -> SystemSpecs {
     }
 }
 
-fn run_fit(perfect: bool, limit: Option<usize>, json: bool, memory_override: &Option<String>) {
+fn resolve_context_limit(max_context: Option<u32>) -> Option<u32> {
+    if max_context.is_some() {
+        return max_context;
+    }
+
+    let Ok(raw) = std::env::var("OLLAMA_CONTEXT_LENGTH") else {
+        return None;
+    };
+    match raw.trim().parse::<u32>() {
+        Ok(v) if v > 0 => Some(v),
+        _ => {
+            eprintln!(
+                "Warning: could not parse OLLAMA_CONTEXT_LENGTH='{}'. Expected a positive integer.",
+                raw
+            );
+            None
+        }
+    }
+}
+
+fn run_fit(
+    perfect: bool,
+    limit: Option<usize>,
+    json: bool,
+    memory_override: &Option<String>,
+    context_limit: Option<u32>,
+) {
     let specs = detect_specs(memory_override);
     let db = ModelDatabase::new();
 
@@ -121,10 +225,17 @@ fn run_fit(perfect: bool, limit: Option<usize>, json: bool, memory_override: &Op
         specs.display();
     }
 
+    let hidden: usize = db
+        .get_all_models()
+        .iter()
+        .filter(|m| !backend_compatible(m, &specs))
+        .count();
+
     let mut fits: Vec<ModelFit> = db
         .get_all_models()
         .iter()
-        .map(|m| ModelFit::analyze(m, &specs))
+        .filter(|m| backend_compatible(m, &specs))
+        .map(|m| ModelFit::analyze_with_context_limit(m, &specs, context_limit))
         .collect();
 
     if perfect {
@@ -140,11 +251,18 @@ fn run_fit(perfect: bool, limit: Option<usize>, json: bool, memory_override: &Op
     if json {
         display::display_json_fits(&specs, &fits);
     } else {
+        if hidden > 0 {
+            eprintln!(
+                "({} model{} hidden — incompatible backend)",
+                hidden,
+                if hidden == 1 { "" } else { "s" }
+            );
+        }
         display::display_model_fits(&fits);
     }
 }
 
-fn run_tui(memory_override: &Option<String>) -> std::io::Result<()> {
+fn run_tui(memory_override: &Option<String>, context_limit: Option<u32>) -> std::io::Result<()> {
     // Setup terminal
     crossterm::terminal::enable_raw_mode()?;
     let mut stdout = std::io::stdout();
@@ -156,10 +274,12 @@ fn run_tui(memory_override: &Option<String>) -> std::io::Result<()> {
 
     let backend = ratatui::backend::CrosstermBackend::new(stdout);
     let mut terminal = ratatui::Terminal::new(backend)?;
+    draw_boot_screen(&mut terminal, "Detecting system hardware...")?;
 
     // Create app state
     let specs = detect_specs(memory_override);
-    let mut app = tui_app::App::with_specs(specs);
+    draw_boot_screen(&mut terminal, "Loading providers and models...")?;
+    let mut app = tui_app::App::with_specs_and_context(specs, context_limit);
 
     // Main loop
     loop {
@@ -186,6 +306,40 @@ fn run_tui(memory_override: &Option<String>) -> std::io::Result<()> {
     Ok(())
 }
 
+fn draw_boot_screen(
+    terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
+    message: &str,
+) -> std::io::Result<()> {
+    use ratatui::layout::{Constraint, Direction, Layout};
+    use ratatui::style::{Modifier, Style};
+    use ratatui::text::{Line, Span};
+    use ratatui::widgets::{Block, Borders, Paragraph};
+
+    terminal.draw(|frame| {
+        let area = frame.area();
+        let layout = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Percentage(45),
+                Constraint::Length(3),
+                Constraint::Percentage(52),
+            ])
+            .split(area);
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(" llmfit ")
+            .title_style(Style::default().add_modifier(Modifier::BOLD));
+        let line = Line::from(vec![
+            Span::raw(" "),
+            Span::styled("Loading: ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(message),
+        ]);
+        frame.render_widget(Paragraph::new(line).block(block), layout[1]);
+    })?;
+    Ok(())
+}
+
 fn run_recommend(
     limit: usize,
     use_case: Option<String>,
@@ -193,6 +347,7 @@ fn run_recommend(
     runtime_filter: String,
     json: bool,
     memory_override: &Option<String>,
+    context_limit: Option<u32>,
 ) {
     let specs = detect_specs(memory_override);
     let db = ModelDatabase::new();
@@ -200,7 +355,8 @@ fn run_recommend(
     let mut fits: Vec<ModelFit> = db
         .get_all_models()
         .iter()
-        .map(|m| ModelFit::analyze(m, &specs))
+        .filter(|m| backend_compatible(m, &specs))
+        .map(|m| ModelFit::analyze_with_context_limit(m, &specs, context_limit))
         .collect();
 
     // Filter by minimum fit level
@@ -220,6 +376,13 @@ fn run_recommend(
         (llmfit_core::fit::FitLevel::Perfect, _) => false,
         _ => true,
     });
+
+    // Hide MLX-only models on non-Apple Silicon systems
+    let is_apple_silicon =
+        specs.backend == llmfit_core::hardware::GpuBackend::Metal && specs.unified_memory;
+    if !is_apple_silicon {
+        fits.retain(|f| !f.model.is_mlx_only());
+    }
 
     // Filter by runtime
     match runtime_filter.to_lowercase().as_str() {
@@ -259,8 +422,345 @@ fn run_recommend(
     }
 }
 
+fn run_download(
+    model: &str,
+    quant: Option<&str>,
+    budget: Option<f64>,
+    list_only: bool,
+    memory_override: &Option<String>,
+) {
+    use llmfit_core::providers::LlamaCppProvider;
+
+    let provider = LlamaCppProvider::new();
+
+    // Resolve repo ID: try known mapping, then treat as repo, then search
+    let repo_id = if model.contains('/') {
+        model.to_string()
+    } else if let Some(repo) = llmfit_core::providers::gguf_pull_tag(model) {
+        repo
+    } else {
+        // Search HuggingFace
+        println!(
+            "Searching HuggingFace for GGUF models matching '{}'...",
+            model
+        );
+        let results = LlamaCppProvider::search_hf_gguf(model);
+        if results.is_empty() {
+            eprintln!(
+                "No GGUF models found for '{}'. Try a different search term.",
+                model
+            );
+            eprintln!("Tip: use 'llmfit hf-search <query>' to browse available models.");
+            std::process::exit(1);
+        }
+        if results.len() > 1 && !list_only {
+            println!("\nFound {} repositories:", results.len());
+            for (i, (id, desc)) in results.iter().enumerate().take(10) {
+                println!("  {}. {} ({})", i + 1, id, desc);
+            }
+            println!("\nUsing first result: {}", results[0].0);
+        }
+        results[0].0.clone()
+    };
+
+    // List available GGUF files
+    println!("Fetching available files from {}...", repo_id);
+    let files = LlamaCppProvider::list_repo_gguf_files(&repo_id);
+    if files.is_empty() {
+        eprintln!("No GGUF files found in repository '{}'.", repo_id);
+        eprintln!("Make sure this is a valid GGUF repository on HuggingFace.");
+        std::process::exit(1);
+    }
+
+    if list_only {
+        println!("\nAvailable GGUF files in {}:", repo_id);
+        println!("{:<60} {:>10}", "Filename", "Size");
+        println!("{}", "-".repeat(72));
+        for (filename, size) in &files {
+            let size_str = if *size > 1_073_741_824 {
+                format!("{:.1} GB", *size as f64 / 1_073_741_824.0)
+            } else {
+                format!("{:.0} MB", *size as f64 / 1_048_576.0)
+            };
+            println!("{:<60} {:>10}", filename, size_str);
+        }
+        return;
+    }
+
+    // Select the file to download
+    let (filename, file_size) = if let Some(q) = quant {
+        // User specified a quantization
+        let q_lower = q.to_lowercase();
+        if let Some((f, s)) = files
+            .iter()
+            .find(|(f, _)| f.to_lowercase().contains(&q_lower))
+        {
+            (f.clone(), *s)
+        } else {
+            eprintln!(
+                "No GGUF file found matching quantization '{}' in {}.",
+                q, repo_id
+            );
+            eprintln!("\nAvailable files:");
+            for (f, s) in &files {
+                let size_str = format!("{:.1} GB", *s as f64 / 1_073_741_824.0);
+                eprintln!("  {} ({})", f, size_str);
+            }
+            std::process::exit(1);
+        }
+    } else {
+        // Auto-select based on hardware budget
+        let mem_budget = if let Some(b) = budget {
+            b
+        } else {
+            let specs = detect_specs(memory_override);
+            specs
+                .total_gpu_vram_gb
+                .or(Some(specs.available_ram_gb))
+                .unwrap_or(16.0)
+        };
+        if let Some(result) = LlamaCppProvider::select_best_gguf(&files, mem_budget) {
+            println!(
+                "Selected {} ({:.1} GB) for {:.0} GB memory budget",
+                result.0,
+                result.1 as f64 / 1_073_741_824.0,
+                mem_budget
+            );
+            result
+        } else {
+            // Nothing fits — pick smallest
+            let mut sorted = files.clone();
+            sorted.sort_by_key(|(_, s)| *s);
+            let (f, s) = sorted.first().expect("files list is not empty");
+            println!(
+                "Warning: No quantization fits within {:.0} GB. Downloading smallest: {} ({:.1} GB)",
+                mem_budget,
+                f,
+                *s as f64 / 1_073_741_824.0
+            );
+            (f.clone(), *s)
+        }
+    };
+
+    println!(
+        "\nDownloading {} ({:.1} GB) to {}",
+        filename,
+        file_size as f64 / 1_073_741_824.0,
+        provider.models_dir().display()
+    );
+
+    match provider.download_gguf(&repo_id, &filename) {
+        Ok(handle) => {
+            // Poll for progress
+            loop {
+                match handle.receiver.recv() {
+                    Ok(llmfit_core::providers::PullEvent::Progress { status, percent }) => {
+                        if let Some(p) = percent {
+                            print!("\r\x1b[K  {:.1}% - {}", p, status);
+                            use std::io::Write;
+                            let _ = std::io::stdout().flush();
+                        } else {
+                            println!("  {}", status);
+                        }
+                    }
+                    Ok(llmfit_core::providers::PullEvent::Done) => {
+                        println!("\n\n✓ Download complete!");
+                        let dest = provider.models_dir().join(&filename);
+                        println!("  Saved to: {}", dest.display());
+                        if provider.llama_cli_path().is_some() {
+                            println!(
+                                "\n  Run with: llmfit run {}",
+                                filename.trim_end_matches(".gguf")
+                            );
+                            println!("  Or directly: llama-cli -m {} -cnv", dest.display());
+                        } else {
+                            println!("\n  Install llama.cpp to run this model:");
+                            println!("    brew install llama.cpp");
+                            println!("    # or build from source:");
+                            println!(
+                                "    git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp"
+                            );
+                            println!("    cmake -B build && cmake --build build --config Release");
+                            println!("\n  Then run: llama-cli -m {} -cnv", dest.display());
+                        }
+                        break;
+                    }
+                    Ok(llmfit_core::providers::PullEvent::Error(e)) => {
+                        eprintln!("\n\n✗ Download failed: {}", e);
+                        std::process::exit(1);
+                    }
+                    Err(_) => {
+                        eprintln!("\n\n✗ Download channel closed unexpectedly");
+                        std::process::exit(1);
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("Failed to start download: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn run_hf_search(query: &str, limit: usize) {
+    use llmfit_core::providers::LlamaCppProvider;
+
+    println!(
+        "Searching HuggingFace for GGUF models matching '{}'...\n",
+        query
+    );
+    let results = LlamaCppProvider::search_hf_gguf(query);
+
+    if results.is_empty() {
+        println!("No GGUF models found. Try a different search term.");
+        return;
+    }
+
+    println!("{:<50} {}", "Repository", "Type");
+    println!("{}", "-".repeat(65));
+    for (id, desc) in results.iter().take(limit) {
+        println!("{:<50} {}", id, desc);
+    }
+
+    println!("\nTo download: llmfit download <repository>");
+    println!("To list files: llmfit download <repository> --list");
+}
+
+fn run_model(model: &str, server: bool, port: u16, ngl: i32, ctx_size: u32) {
+    use llmfit_core::providers::LlamaCppProvider;
+
+    let provider = LlamaCppProvider::new();
+
+    // Find the model file
+    let model_path = if std::path::Path::new(model).exists() {
+        std::path::PathBuf::from(model)
+    } else {
+        // Search in cache directory
+        let gguf_files = provider.list_gguf_files();
+        let search = model.to_lowercase();
+        let found = gguf_files.into_iter().find(|p| {
+            p.file_stem()
+                .and_then(|s| s.to_str())
+                .map(|s| s.to_lowercase().contains(&search))
+                .unwrap_or(false)
+        });
+        match found {
+            Some(p) => p,
+            None => {
+                eprintln!("Model '{}' not found.", model);
+                eprintln!("\nAvailable models in {}:", provider.models_dir().display());
+                for f in provider.list_gguf_files() {
+                    eprintln!("  {}", f.file_name().unwrap_or_default().to_string_lossy());
+                }
+                eprintln!("\nUse 'llmfit download <model>' to download a model first.");
+                std::process::exit(1);
+            }
+        }
+    };
+
+    if server {
+        let Some(bin) = provider.llama_server_path() else {
+            eprintln!("llama-server not found in PATH.");
+            eprintln!("Install llama.cpp: brew install llama.cpp");
+            eprintln!("Or build from source: https://github.com/ggml-org/llama.cpp");
+            std::process::exit(1);
+        };
+
+        println!(
+            "Starting llama-server on port {} with {}...",
+            port,
+            model_path.display()
+        );
+        let status = std::process::Command::new(bin)
+            .args([
+                "-m",
+                model_path.to_str().unwrap_or(""),
+                "--port",
+                &port.to_string(),
+                "-ngl",
+                &ngl.to_string(),
+                "-c",
+                &ctx_size.to_string(),
+            ])
+            .status();
+
+        match status {
+            Ok(s) if !s.success() => {
+                std::process::exit(s.code().unwrap_or(1));
+            }
+            Err(e) => {
+                eprintln!("Failed to run llama-server: {}", e);
+                std::process::exit(1);
+            }
+            _ => {}
+        }
+    } else {
+        let Some(bin) = provider.llama_cli_path() else {
+            eprintln!("llama-cli not found in PATH.");
+            eprintln!("Install llama.cpp: brew install llama.cpp");
+            eprintln!("Or build from source: https://github.com/ggml-org/llama.cpp");
+            std::process::exit(1);
+        };
+
+        println!("Running {} with llama-cli...\n", model_path.display());
+        let status = std::process::Command::new(bin)
+            .args([
+                "-m",
+                model_path.to_str().unwrap_or(""),
+                "-ngl",
+                &ngl.to_string(),
+                "-c",
+                &ctx_size.to_string(),
+                "-cnv",
+            ])
+            .status();
+
+        match status {
+            Ok(s) if !s.success() => {
+                std::process::exit(s.code().unwrap_or(1));
+            }
+            Err(e) => {
+                eprintln!("Failed to run llama-cli: {}", e);
+                std::process::exit(1);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn run_plan(
+    model_selector: &str,
+    context: u32,
+    quant: Option<String>,
+    target_tps: Option<f64>,
+    json: bool,
+    memory_override: &Option<String>,
+) -> Result<(), String> {
+    let db = ModelDatabase::new();
+    let specs = detect_specs(memory_override);
+    let model = resolve_model_selector(db.get_all_models(), model_selector)?;
+
+    let request = PlanRequest {
+        context,
+        quant,
+        target_tps,
+    };
+    let plan = estimate_model_plan(model, &request, &specs)?;
+
+    if json {
+        display::display_json_plan(&plan);
+    } else {
+        specs.display();
+        display::display_model_plan(&plan);
+    }
+
+    Ok(())
+}
+
 fn main() {
     let cli = Cli::parse();
+    let context_limit = resolve_context_limit(cli.max_context);
 
     // If a subcommand is given, use classic CLI mode
     if let Some(command) = cli.command {
@@ -280,7 +780,7 @@ fn main() {
             }
 
             Commands::Fit { perfect, limit } => {
-                run_fit(perfect, limit, cli.json, &cli.memory);
+                run_fit(perfect, limit, cli.json, &cli.memory, context_limit);
             }
 
             Commands::Search { query } => {
@@ -307,11 +807,25 @@ fn main() {
                     return;
                 }
 
-                let fit = ModelFit::analyze(results[0], &specs);
+                let fit = ModelFit::analyze_with_context_limit(results[0], &specs, context_limit);
                 if cli.json {
                     display::display_json_fits(&specs, &[fit]);
                 } else {
                     display::display_model_detail(&fit);
+                }
+            }
+
+            Commands::Plan {
+                model,
+                context,
+                quant,
+                target_tps,
+            } => {
+                if let Err(err) =
+                    run_plan(&model, context, quant, target_tps, cli.json, &cli.memory)
+                {
+                    eprintln!("Error: {}", err);
+                    std::process::exit(1);
                 }
             }
 
@@ -322,7 +836,38 @@ fn main() {
                 runtime,
                 json,
             } => {
-                run_recommend(limit, use_case, min_fit, runtime, json, &cli.memory);
+                run_recommend(
+                    limit,
+                    use_case,
+                    min_fit,
+                    runtime,
+                    json,
+                    &cli.memory,
+                    context_limit,
+                );
+            }
+
+            Commands::Download {
+                model,
+                quant,
+                budget,
+                list,
+            } => {
+                run_download(&model, quant.as_deref(), budget, list, &cli.memory);
+            }
+
+            Commands::HfSearch { query, limit } => {
+                run_hf_search(&query, limit);
+            }
+
+            Commands::Run {
+                model,
+                server,
+                port,
+                ngl,
+                ctx_size,
+            } => {
+                run_model(&model, server, port, ngl, ctx_size);
             }
         }
         return;
@@ -330,12 +875,12 @@ fn main() {
 
     // If --cli flag, use classic fit output
     if cli.cli {
-        run_fit(cli.perfect, cli.limit, cli.json, &cli.memory);
+        run_fit(cli.perfect, cli.limit, cli.json, &cli.memory, context_limit);
         return;
     }
 
     // Default: launch TUI
-    if let Err(e) = run_tui(&cli.memory) {
+    if let Err(e) = run_tui(&cli.memory, context_limit) {
         eprintln!("Error running TUI: {}", e);
         std::process::exit(1);
     }

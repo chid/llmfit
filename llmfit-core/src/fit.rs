@@ -22,6 +22,7 @@ impl InferenceRuntime {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortColumn {
     Score,
+    Tps,
     Params,
     MemPct,
     Ctx,
@@ -33,6 +34,7 @@ impl SortColumn {
     pub fn label(&self) -> &str {
         match self {
             SortColumn::Score => "Score",
+            SortColumn::Tps => "tok/s",
             SortColumn::Params => "Params",
             SortColumn::MemPct => "Mem%",
             SortColumn::Ctx => "Ctx",
@@ -43,7 +45,8 @@ impl SortColumn {
 
     pub fn next(&self) -> Self {
         match self {
-            SortColumn::Score => SortColumn::Params,
+            SortColumn::Score => SortColumn::Tps,
+            SortColumn::Tps => SortColumn::Params,
             SortColumn::Params => SortColumn::MemPct,
             SortColumn::MemPct => SortColumn::Ctx,
             SortColumn::Ctx => SortColumn::ReleaseDate,
@@ -98,7 +101,7 @@ pub struct ModelFit {
     pub moe_offloaded_gb: Option<f64>, // GB of inactive experts offloaded to RAM
     pub score: f64,                    // weighted composite score 0-100
     pub score_components: ScoreComponents,
-    pub estimated_tps: f64,        // estimated tokens per second
+    pub estimated_tps: f64,        // baseline estimated tokens per second
     pub best_quant: String,        // best quantization for this hardware
     pub use_case: UseCase,         // inferred use case category
     pub runtime: InferenceRuntime, // inference runtime (MLX or llama.cpp)
@@ -107,12 +110,29 @@ pub struct ModelFit {
 
 impl ModelFit {
     pub fn analyze(model: &LlmModel, system: &SystemSpecs) -> Self {
+        Self::analyze_with_context_limit(model, system, None)
+    }
+
+    pub fn analyze_with_context_limit(
+        model: &LlmModel,
+        system: &SystemSpecs,
+        context_limit: Option<u32>,
+    ) -> Self {
         let mut notes = Vec::new();
+        let estimation_ctx = context_limit
+            .map(|limit| limit.min(model.context_length))
+            .unwrap_or(model.context_length);
 
         let min_vram = model.min_vram_gb.unwrap_or(model.min_ram_gb);
         let use_case = UseCase::from_model(model);
         let default_mem_required =
-            model.estimate_memory_gb(model.quantization.as_str(), model.context_length);
+            model.estimate_memory_gb(model.quantization.as_str(), estimation_ctx);
+        if estimation_ctx < model.context_length {
+            notes.push(format!(
+                "Context capped for estimation: {} -> {} tokens",
+                model.context_length, estimation_ctx
+            ));
+        }
 
         // Determine inference runtime up front so path selection can use
         // the correct quantization hierarchy.
@@ -121,13 +141,15 @@ impl ModelFit {
         } else {
             InferenceRuntime::LlamaCpp
         };
-        let choose_quant = |budget: f64| best_quant_for_runtime_budget(model, runtime, budget);
+        let choose_quant =
+            |budget: f64| best_quant_for_runtime_budget(model, runtime, budget, estimation_ctx);
 
         // Step 1: pick the best available execution path
         // Step 2: score memory fit purely on headroom in that path's memory pool
         let (run_mode, mem_required, mem_available) = if system.has_gpu {
             if system.unified_memory {
-                // Apple Silicon: GPU and CPU share the same memory pool.
+                // Unified memory (Apple Silicon or NVIDIA Tegra/Grace Blackwell):
+                // GPU and CPU share the same memory pool.
                 // No CpuOffload -- there's no separate pool to spill to.
                 if let Some(pool) = system.gpu_vram_gb {
                     notes.push("Unified memory: GPU and CPU share the same pool".to_string());
@@ -146,7 +168,7 @@ impl ModelFit {
                         (RunMode::Gpu, default_mem_required, pool)
                     }
                 } else {
-                    cpu_path(model, system, runtime, &mut notes)
+                    cpu_path(model, system, runtime, estimation_ctx, &mut notes)
                 }
             } else if let Some(system_vram) = system.total_gpu_vram_gb {
                 // Use total VRAM across all same-model GPUs for fit scoring.
@@ -184,10 +206,10 @@ impl ModelFit {
             } else {
                 // GPU detected but VRAM unknown -- fall through to CPU
                 notes.push("GPU detected but VRAM unknown".to_string());
-                cpu_path(model, system, runtime, &mut notes)
+                cpu_path(model, system, runtime, estimation_ctx, &mut notes)
             }
         } else {
-            cpu_path(model, system, runtime, &mut notes)
+            cpu_path(model, system, runtime, estimation_ctx, &mut notes)
         };
 
         // Score fit purely on memory headroom (Perfect requires GPU)
@@ -228,11 +250,11 @@ impl ModelFit {
             models::QUANT_HIERARCHY
         };
         let (best_quant, _best_quant_mem) = model
-            .best_quant_for_budget_with(budget, model.context_length, hierarchy)
+            .best_quant_for_budget_with(budget, estimation_ctx, hierarchy)
             .or_else(|| {
                 // Fall back to GGUF hierarchy if MLX quants don't fit
                 if runtime == InferenceRuntime::Mlx {
-                    model.best_quant_for_budget(budget, model.context_length)
+                    model.best_quant_for_budget(budget, estimation_ctx)
                 } else {
                     None
                 }
@@ -283,7 +305,10 @@ impl ModelFit {
         let score = weighted_score(score_components, use_case);
 
         if estimated_tps > 0.0 {
-            notes.push(format!("Estimated speed: {:.1} tok/s", estimated_tps));
+            notes.push(format!(
+                "Baseline estimated speed: {:.1} tok/s",
+                estimated_tps
+            ));
         }
 
         ModelFit {
@@ -390,6 +415,7 @@ fn cpu_path(
     model: &LlmModel,
     system: &SystemSpecs,
     runtime: InferenceRuntime,
+    estimation_ctx: u32,
     notes: &mut Vec<String>,
 ) -> (RunMode, f64, f64) {
     notes.push("CPU-only: model loaded into system RAM".to_string());
@@ -399,13 +425,13 @@ fn cpu_path(
     }
 
     if let Some((_, best_mem)) =
-        best_quant_for_runtime_budget(model, runtime, system.available_ram_gb)
+        best_quant_for_runtime_budget(model, runtime, system.available_ram_gb, estimation_ctx)
     {
         (RunMode::CpuOnly, best_mem, system.available_ram_gb)
     } else {
         (
             RunMode::CpuOnly,
-            model.estimate_memory_gb(model.quantization.as_str(), model.context_length),
+            model.estimate_memory_gb(model.quantization.as_str(), estimation_ctx),
             system.available_ram_gb,
         )
     }
@@ -512,6 +538,7 @@ fn best_quant_for_runtime_budget(
     model: &LlmModel,
     runtime: InferenceRuntime,
     budget: f64,
+    estimation_ctx: u32,
 ) -> Option<(&'static str, f64)> {
     let hierarchy: &[&str] = if runtime == InferenceRuntime::Mlx {
         models::MLX_QUANT_HIERARCHY
@@ -519,14 +546,22 @@ fn best_quant_for_runtime_budget(
         models::QUANT_HIERARCHY
     };
     model
-        .best_quant_for_budget_with(budget, model.context_length, hierarchy)
+        .best_quant_for_budget_with(budget, estimation_ctx, hierarchy)
         .or_else(|| {
             if runtime == InferenceRuntime::Mlx {
-                model.best_quant_for_budget(budget, model.context_length)
+                model.best_quant_for_budget(budget, estimation_ctx)
             } else {
                 None
             }
         })
+}
+
+pub fn backend_compatible(model: &LlmModel, system: &SystemSpecs) -> bool {
+    if model.is_mlx_model() {
+        system.backend == GpuBackend::Metal && system.unified_memory
+    } else {
+        true
+    }
 }
 
 pub fn rank_models_by_fit(models: Vec<ModelFit>) -> Vec<ModelFit> {
@@ -568,6 +603,19 @@ pub fn rank_models_by_fit_opts_col(
                 .score
                 .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal),
+            SortColumn::Tps => {
+                let cmp = b
+                    .estimated_tps
+                    .partial_cmp(&a.estimated_tps)
+                    .unwrap_or(std::cmp::Ordering::Equal);
+                if cmp == std::cmp::Ordering::Equal {
+                    b.score
+                        .partial_cmp(&a.score)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                } else {
+                    cmp
+                }
+            }
             SortColumn::Params => {
                 let a_params = a.model.params_b();
                 let b_params = b.model.params_b();
@@ -623,7 +671,27 @@ pub fn rank_models_by_fit_opts_col(
 // ────────────────────────────────────────────────────────────────────
 
 /// Estimate tokens per second for a model on given hardware.
-/// Based on backend speed constants / model params * quant multiplier.
+/// Estimate tokens per second for a model on the given hardware.
+///
+/// LLM token generation is **memory-bandwidth-bound**: each generated token
+/// requires reading the full model weights once from VRAM. The theoretical
+/// upper bound is therefore:
+///
+///   max_tps = memory_bandwidth_GB_s / model_size_GB
+///
+/// In practice, real throughput is ~50–70% of this ceiling due to kernel
+/// launch overhead, KV-cache reads, and other fixed costs.
+///
+/// When the GPU model is recognized, we use its **actual memory bandwidth**
+/// (from the lookup table in `hardware::gpu_memory_bandwidth_gbps`) to
+/// produce a physics-grounded estimate. Otherwise we fall back to the
+/// original per-backend constant `K`.
+///
+/// References:
+///  - kipply, "Transformer Inference Arithmetic" (2022)
+///  - ggerganov, llama.cpp Apple Silicon benchmarks (Discussion #4167)
+///  - Google, "Efficiently Scaling Transformer Inference" (arXiv:2211.05102)
+///  - ggerganov, llama.cpp NVIDIA T4 benchmarks (Discussion #4225)
 fn estimate_tps(
     model: &LlmModel,
     quant: &str,
@@ -631,7 +699,62 @@ fn estimate_tps(
     run_mode: RunMode,
     runtime: InferenceRuntime,
 ) -> f64 {
-    // Backend speed constant K (higher = faster)
+    use crate::hardware::gpu_memory_bandwidth_gbps;
+
+    // MoE models execute only active experts per token, so speed estimates should
+    // use active parameters when known; fit/memory paths still use full model size.
+    let params = model
+        .active_parameters
+        .filter(|_| model.is_moe)
+        .map(|p| (p as f64) / 1_000_000_000.0)
+        .unwrap_or_else(|| model.params_b())
+        .max(0.1);
+
+    // ── Bandwidth-based estimation (preferred) ─────────────────────
+    //
+    // If we know the GPU's memory bandwidth, estimate tok/s from first
+    // principles instead of using a fixed constant.
+    //
+    // model_bytes = params_B * bytes_per_param(quant)
+    // raw_tps     = bandwidth_GB_s / model_bytes_GB
+    // estimated   = raw_tps * efficiency * run_mode_factor
+    //
+    // The efficiency factor (0.55) accounts for:
+    //  - Kernel launch / scheduling overhead
+    //  - KV-cache memory reads (not captured in model size)
+    //  - Memory controller inefficiency at high utilization
+    //
+    // Validated against:
+    //  - RTX 4090 (1008 GB/s): Qwen3.5-27B Q4 → ~40 tok/s measured
+    //  - T4 (320 GB/s): 7B F16 → ~16 tok/s (ggerganov benchmark)
+    //  - Apple M1 Max (400 GB/s): 7B Q4_0 → ~61 tok/s (ggerganov benchmark)
+    let gpu_name = system.gpu_name.as_deref().unwrap_or("");
+    let bandwidth = gpu_memory_bandwidth_gbps(gpu_name);
+
+    if run_mode != RunMode::CpuOnly {
+        if let Some(bw) = bandwidth {
+            let bytes_per_param = models::quant_bytes_per_param(quant);
+            let model_gb = params * bytes_per_param;
+
+            // Efficiency factor — captures overhead not in the simple
+            // bandwidth / model-size formula.
+            let efficiency = 0.55;
+            let raw_tps = (bw / model_gb) * efficiency;
+
+            let mode_factor = match run_mode {
+                RunMode::Gpu => 1.0,
+                RunMode::MoeOffload => 0.8,
+                RunMode::CpuOffload => 0.5,
+                RunMode::CpuOnly => unreachable!(),
+            };
+
+            return (raw_tps * mode_factor).max(0.1);
+        }
+    }
+
+    // ── Fallback: fixed-constant approach ──────────────────────────
+    // Used when the GPU is not recognized (custom/unnamed GPUs,
+    // synthetic entries from --memory override, etc.).
     let k: f64 = match (system.backend, runtime) {
         (GpuBackend::Metal, InferenceRuntime::Mlx) => 250.0,
         (GpuBackend::Metal, InferenceRuntime::LlamaCpp) => 160.0,
@@ -641,9 +764,9 @@ fn estimate_tps(
         (GpuBackend::Sycl, _) => 100.0,
         (GpuBackend::CpuArm, _) => 90.0,
         (GpuBackend::CpuX86, _) => 70.0,
+        (GpuBackend::Ascend, _) => 390.0,
     };
 
-    let params = model.params_b().max(0.1);
     let mut base = k / params;
 
     // Quantization speed multiplier
@@ -864,6 +987,7 @@ mod tests {
             active_experts: None,
             active_parameters: None,
             release_date: None,
+            gguf_sources: vec![],
         }
     }
 
@@ -1037,6 +1161,7 @@ mod tests {
             active_experts: Some(2),
             active_parameters: Some(12_900_000_000),
             release_date: None,
+            gguf_sources: vec![],
         };
         let mut system = test_system(64.0, true, Some(8.0));
         system.backend = GpuBackend::Cuda;
@@ -1067,6 +1192,7 @@ mod tests {
             active_experts: None,
             active_parameters: None,
             release_date: None,
+            gguf_sources: vec![],
         };
         let system = test_system(12.0, true, Some(8.0));
 
@@ -1319,6 +1445,24 @@ mod tests {
     }
 
     #[test]
+    fn test_analyze_with_context_limit_reduces_memory_estimate() {
+        let mut model = test_model("7B", 4.0, Some(4.0));
+        model.context_length = 32768;
+        let system = test_system(32.0, true, Some(16.0));
+
+        let baseline = ModelFit::analyze(&model, &system);
+        let capped = ModelFit::analyze_with_context_limit(&model, &system, Some(4096));
+
+        assert!(capped.memory_required_gb < baseline.memory_required_gb);
+        assert!(
+            capped
+                .notes
+                .iter()
+                .any(|n| n.contains("Context capped for estimation"))
+        );
+    }
+
+    #[test]
     fn test_estimate_tps_run_mode_penalties() {
         let model = test_model("7B", 4.0, Some(4.0));
         let system = test_system(16.0, true, Some(10.0));
@@ -1362,9 +1506,84 @@ mod tests {
         assert!(tps_cpu > 0.0);
     }
 
+    #[test]
+    fn test_estimate_tps_moe_uses_active_parameters() {
+        let dense_model = test_model("30B", 18.0, Some(18.0));
+        let mut moe_model = dense_model.clone();
+        moe_model.is_moe = true;
+        moe_model.active_parameters = Some(3_000_000_000);
+
+        let system = test_system(64.0, true, Some(24.0));
+
+        let tps_dense = estimate_tps(
+            &dense_model,
+            "Q4_K_M",
+            &system,
+            RunMode::Gpu,
+            InferenceRuntime::LlamaCpp,
+        );
+        let tps_moe = estimate_tps(
+            &moe_model,
+            "Q4_K_M",
+            &system,
+            RunMode::Gpu,
+            InferenceRuntime::LlamaCpp,
+        );
+
+        assert!(tps_moe > tps_dense * 5.0);
+    }
+
+    #[test]
+    fn test_estimate_tps_moe_without_active_parameters_falls_back_to_total() {
+        let dense_model = test_model("30B", 18.0, Some(18.0));
+        let mut moe_without_active = dense_model.clone();
+        moe_without_active.is_moe = true;
+        moe_without_active.active_parameters = None;
+
+        let system = test_system(64.0, true, Some(24.0));
+
+        let tps_dense = estimate_tps(
+            &dense_model,
+            "Q4_K_M",
+            &system,
+            RunMode::Gpu,
+            InferenceRuntime::LlamaCpp,
+        );
+        let tps_moe = estimate_tps(
+            &moe_without_active,
+            "Q4_K_M",
+            &system,
+            RunMode::Gpu,
+            InferenceRuntime::LlamaCpp,
+        );
+
+        assert_eq!(tps_dense, tps_moe);
+    }
+
     // ────────────────────────────────────────────────────────────────────
     // Release date sorting tests
     // ────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_sort_by_tps() {
+        let system = test_system(32.0, true, Some(16.0));
+
+        let mut model_fast = test_model("7B", 4.0, Some(4.0));
+        model_fast.name = "Fast Model".to_string();
+
+        let mut model_slow = test_model("14B", 8.0, Some(8.0));
+        model_slow.name = "Slow Model".to_string();
+
+        let fits = vec![
+            ModelFit::analyze(&model_slow, &system),
+            ModelFit::analyze(&model_fast, &system),
+        ];
+
+        let ranked = rank_models_by_fit_opts_col(fits, false, SortColumn::Tps);
+
+        assert!(ranked[0].estimated_tps >= ranked[1].estimated_tps);
+        assert_eq!(ranked[0].model.name, "Fast Model");
+    }
 
     #[test]
     fn test_sort_by_release_date() {
@@ -1394,5 +1613,141 @@ mod tests {
         assert_eq!(ranked[0].model.name, "New Model");
         assert_eq!(ranked[1].model.name, "Old Model");
         assert_eq!(ranked[2].model.name, "No Date Model");
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Bandwidth-based speed estimation tests
+    // ────────────────────────────────────────────────────────────────────
+
+    /// Helper: create a test system with a specific GPU name for bandwidth lookup.
+    fn test_system_with_gpu(ram: f64, vram: f64, gpu_name: &str) -> SystemSpecs {
+        SystemSpecs {
+            total_ram_gb: ram,
+            available_ram_gb: ram * 0.8,
+            total_cpu_cores: 8,
+            cpu_name: "Test CPU".to_string(),
+            has_gpu: true,
+            gpu_vram_gb: Some(vram),
+            total_gpu_vram_gb: Some(vram),
+            gpu_name: Some(gpu_name.to_string()),
+            gpu_count: 1,
+            unified_memory: false,
+            backend: GpuBackend::Cuda,
+            gpus: vec![],
+        }
+    }
+
+    #[test]
+    fn test_bandwidth_estimation_rtx4090_faster_than_rtx3060() {
+        let model = test_model("27B", 16.0, Some(16.0));
+        let sys_4090 = test_system_with_gpu(64.0, 24.0, "NVIDIA GeForce RTX 4090");
+        let sys_3060 = test_system_with_gpu(64.0, 12.0, "NVIDIA GeForce RTX 3060");
+
+        let tps_4090 = estimate_tps(
+            &model,
+            "Q4_K_M",
+            &sys_4090,
+            RunMode::Gpu,
+            InferenceRuntime::LlamaCpp,
+        );
+        let tps_3060 = estimate_tps(
+            &model,
+            "Q4_K_M",
+            &sys_3060,
+            RunMode::Gpu,
+            InferenceRuntime::LlamaCpp,
+        );
+
+        // RTX 4090 (1008 GB/s) should be ~2.8x faster than RTX 3060 (360 GB/s)
+        assert!(
+            tps_4090 > tps_3060 * 2.0,
+            "4090={tps_4090}, 3060={tps_3060}"
+        );
+    }
+
+    #[test]
+    fn test_bandwidth_estimation_rtx4090_27b_q4_realistic() {
+        // Validated against real-world measurement:
+        // Qwen3.5-27B UD-Q4_K_XL on RTX 4090 → ~40 tok/s
+        let model = test_model("27B", 16.0, Some(16.0));
+        let system = test_system_with_gpu(64.0, 24.0, "NVIDIA GeForce RTX 4090");
+
+        let tps = estimate_tps(
+            &model,
+            "Q4_K_M",
+            &system,
+            RunMode::Gpu,
+            InferenceRuntime::LlamaCpp,
+        );
+
+        // Should be in the 30-50 tok/s range (measured: ~40)
+        assert!(tps > 25.0 && tps < 55.0, "RTX 4090 27B Q4 tok/s = {tps}");
+    }
+
+    #[test]
+    fn test_bandwidth_estimation_t4_7b_f16_realistic() {
+        // Validated against ggerganov's T4 benchmark (Discussion #4225):
+        // OpenHermes 7B F16 on T4 → ~16 tok/s
+        let model = test_model("7B", 14.0, Some(14.0));
+        let system = test_system_with_gpu(16.0, 16.0, "Tesla T4");
+
+        let tps = estimate_tps(
+            &model,
+            "F16",
+            &system,
+            RunMode::Gpu,
+            InferenceRuntime::LlamaCpp,
+        );
+
+        // Should be in the 10-25 tok/s range (measured: ~16)
+        assert!(tps > 8.0 && tps < 30.0, "T4 7B F16 tok/s = {tps}");
+    }
+
+    #[test]
+    fn test_bandwidth_estimation_unknown_gpu_uses_fallback() {
+        // Unknown GPU names should still produce reasonable estimates
+        // via the fallback constant-K path.
+        let model = test_model("7B", 4.0, Some(4.0));
+        let system = test_system_with_gpu(16.0, 10.0, "Some Unknown GPU");
+
+        let tps = estimate_tps(
+            &model,
+            "Q4_K_M",
+            &system,
+            RunMode::Gpu,
+            InferenceRuntime::LlamaCpp,
+        );
+
+        // Should fall back to K=220 path and produce a positive value
+        assert!(tps > 0.0, "unknown GPU should still produce an estimate");
+    }
+
+    #[test]
+    fn test_bandwidth_estimation_cpu_only_ignores_bandwidth() {
+        // CPU-only mode should NOT use GPU bandwidth, even if GPU is known.
+        let model = test_model("7B", 4.0, Some(4.0));
+        let sys_4090 = test_system_with_gpu(64.0, 24.0, "NVIDIA GeForce RTX 4090");
+        let sys_unknown = test_system_with_gpu(64.0, 24.0, "Unknown GPU");
+
+        let tps_4090 = estimate_tps(
+            &model,
+            "Q4_K_M",
+            &sys_4090,
+            RunMode::CpuOnly,
+            InferenceRuntime::LlamaCpp,
+        );
+        let tps_unknown = estimate_tps(
+            &model,
+            "Q4_K_M",
+            &sys_unknown,
+            RunMode::CpuOnly,
+            InferenceRuntime::LlamaCpp,
+        );
+
+        // CPU-only should produce the same result regardless of GPU
+        assert!(
+            (tps_4090 - tps_unknown).abs() < 0.01,
+            "CPU-only should ignore GPU: 4090={tps_4090}, unknown={tps_unknown}"
+        );
     }
 }

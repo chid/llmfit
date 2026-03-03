@@ -10,7 +10,9 @@ use ratatui::{
 };
 
 use crate::theme::ThemeColors;
-use crate::tui_app::{App, FitFilter, InputMode};
+use crate::tui_app::{
+    App, AvailabilityFilter, DownloadCapability, DownloadProvider, FitFilter, InputMode, PlanField,
+};
 use llmfit_core::fit::FitLevel;
 use llmfit_core::fit::SortColumn;
 use llmfit_core::hardware::is_running_in_wsl;
@@ -38,7 +40,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_system_bar(frame, app, outer[0], &tc);
     draw_search_and_filters(frame, app, outer[1], &tc);
 
-    if app.show_detail {
+    if app.show_plan {
+        draw_plan(frame, app, outer[2], &tc);
+    } else if app.show_detail {
         draw_detail(frame, app, outer[2], &tc);
     } else {
         draw_table(frame, app, outer[2], &tc);
@@ -46,9 +50,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     draw_status_bar(frame, app, outer[3], &tc);
 
-    // Draw provider popup on top if active
+    // Draw popup overlays on top if active
     if app.input_mode == InputMode::ProviderPopup {
         draw_provider_popup(frame, app, &tc);
+    } else if app.input_mode == InputMode::UseCasePopup {
+        draw_use_case_popup(frame, app, &tc);
+    } else if app.input_mode == InputMode::DownloadProviderPopup {
+        draw_download_provider_popup(frame, app, &tc);
     }
 }
 
@@ -116,7 +124,23 @@ fn draw_system_bar(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
         tc.muted
     };
 
-    let text = Line::from(vec![
+    let llamacpp_info = if app.llamacpp_available {
+        let n = app.llamacpp_installed.len() / 2; // stems + base names
+        format!("llama.cpp: ✓ ({} models)", n)
+    } else if !app.llamacpp_installed.is_empty() {
+        format!("llama.cpp: ({} cached)", app.llamacpp_installed.len() / 2)
+    } else {
+        "llama.cpp: ✗".to_string()
+    };
+    let llamacpp_color = if app.llamacpp_available {
+        tc.good
+    } else if !app.llamacpp_installed.is_empty() {
+        tc.warning
+    } else {
+        tc.muted
+    };
+
+    let mut spans = vec![
         Span::styled(" CPU: ", Style::default().fg(tc.muted)),
         Span::styled(
             format!(
@@ -142,7 +166,27 @@ fn draw_system_bar(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
         Span::styled(ollama_info, Style::default().fg(ollama_color)),
         Span::styled("  │  ", Style::default().fg(tc.muted)),
         Span::styled(mlx_info, Style::default().fg(mlx_color)),
-    ]);
+        Span::styled("  │  ", Style::default().fg(tc.muted)),
+        Span::styled(llamacpp_info, Style::default().fg(llamacpp_color)),
+    ];
+
+    if app.backend_hidden_count > 0 {
+        spans.push(Span::styled("  │  ", Style::default().fg(tc.muted)));
+        spans.push(Span::styled(
+            format!(
+                "{} model{} hidden (incompatible backend)",
+                app.backend_hidden_count,
+                if app.backend_hidden_count == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            ),
+            Style::default().fg(tc.muted),
+        ));
+    }
+
+    let text = Line::from(spans);
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -159,9 +203,11 @@ fn draw_search_and_filters(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeC
         .direction(Direction::Horizontal)
         .constraints([
             Constraint::Min(30),    // search
-            Constraint::Length(24), // provider summary
+            Constraint::Length(18), // provider summary
+            Constraint::Length(18), // use-case summary
             Constraint::Length(18), // sort column
             Constraint::Length(20), // fit filter
+            Constraint::Length(20), // availability filter
             Constraint::Length(16), // theme
         ])
         .split(area);
@@ -169,7 +215,11 @@ fn draw_search_and_filters(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeC
     // Search box
     let search_style = match app.input_mode {
         InputMode::Search => Style::default().fg(tc.accent_secondary),
-        InputMode::Normal | InputMode::ProviderPopup => Style::default().fg(tc.muted),
+        InputMode::Normal
+        | InputMode::Plan
+        | InputMode::ProviderPopup
+        | InputMode::UseCasePopup
+        | InputMode::DownloadProviderPopup => Style::default().fg(tc.muted),
     };
 
     let search_text = if app.search_query.is_empty() && app.input_mode == InputMode::Normal {
@@ -216,7 +266,7 @@ fn draw_search_and_filters(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeC
     let provider_block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(tc.border))
-        .title(" Providers (p) ")
+        .title(" Providers (P) ")
         .title_style(Style::default().fg(tc.muted));
 
     let providers = Paragraph::new(Line::from(Span::styled(
@@ -225,6 +275,35 @@ fn draw_search_and_filters(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeC
     )))
     .block(provider_block);
     frame.render_widget(providers, chunks[1]);
+
+    // Use-case filter summary
+    let active_count = app.selected_use_cases.iter().filter(|&&s| s).count();
+    let total_count = app.use_cases.len();
+    let use_case_text = if active_count == total_count {
+        "All".to_string()
+    } else {
+        format!("{}/{}", active_count, total_count)
+    };
+    let use_case_color = if active_count == total_count {
+        tc.good
+    } else if active_count == 0 {
+        tc.error
+    } else {
+        tc.warning
+    };
+
+    let use_case_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(tc.border))
+        .title(" Use Case (U) ")
+        .title_style(Style::default().fg(tc.muted));
+
+    let use_cases = Paragraph::new(Line::from(Span::styled(
+        format!(" {}", use_case_text),
+        Style::default().fg(use_case_color),
+    )))
+    .block(use_case_block);
+    frame.render_widget(use_cases, chunks[2]);
 
     // Sort column
     let sort_block = Block::default()
@@ -238,7 +317,7 @@ fn draw_search_and_filters(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeC
         Style::default().fg(tc.accent),
     )))
     .block(sort_block);
-    frame.render_widget(sort_text, chunks[2]);
+    frame.render_widget(sort_text, chunks[3]);
 
     // Fit filter
     let fit_style = match app.fit_filter {
@@ -258,7 +337,27 @@ fn draw_search_and_filters(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeC
 
     let fit_text = Paragraph::new(Line::from(Span::styled(app.fit_filter.label(), fit_style)))
         .block(fit_block);
-    frame.render_widget(fit_text, chunks[3]);
+    frame.render_widget(fit_text, chunks[4]);
+
+    // Availability filter
+    let avail_style = match app.availability_filter {
+        AvailabilityFilter::All => Style::default().fg(tc.fg),
+        AvailabilityFilter::HasGguf => Style::default().fg(tc.info),
+        AvailabilityFilter::Installed => Style::default().fg(tc.good),
+    };
+
+    let avail_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(tc.border))
+        .title(" Avail [a] ")
+        .title_style(Style::default().fg(tc.muted));
+
+    let avail_text = Paragraph::new(Line::from(Span::styled(
+        app.availability_filter.label(),
+        avail_style,
+    )))
+    .block(avail_block);
+    frame.render_widget(avail_text, chunks[5]);
 
     // Theme indicator
     let theme_block = Block::default()
@@ -272,7 +371,7 @@ fn draw_search_and_filters(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeC
         Style::default().fg(tc.info),
     )))
     .block(theme_block);
-    frame.render_widget(theme_text, chunks[4]);
+    frame.render_widget(theme_text, chunks[6]);
 }
 
 fn fit_color(level: FitLevel, tc: &ThemeColors) -> Color {
@@ -318,11 +417,12 @@ fn pull_indicator(percent: Option<f64>, tick: u64) -> String {
 fn draw_table(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColors) {
     let sort_col = app.sort_column;
     let header_names = [
-        "", "Inst", "Model", "Provider", "Params", "Score", "tok/s", "Quant", "Mode", "Mem %",
+        "", "Inst", "Model", "Provider", "Params", "Score", "tok/s*", "Quant", "Mode", "Mem %",
         "Ctx", "Date", "Fit", "Use Case",
     ];
     let sort_col_idx: Option<usize> = match sort_col {
         SortColumn::Score => Some(5),
+        SortColumn::Tps => Some(6),
         SortColumn::Params => Some(4),
         SortColumn::MemPct => Some(9),
         SortColumn::Ctx => Some(10),
@@ -342,9 +442,20 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColors) {
     });
     let header = Row::new(header_cells).height(1);
 
+    let visible_rows = (area.height as usize).saturating_sub(3).max(1);
+    let total_rows = app.filtered_fits.len();
+    let viewport_start = if total_rows <= visible_rows || app.selected_row < visible_rows {
+        0
+    } else {
+        app.selected_row + 1 - visible_rows
+    };
+    let viewport_end = (viewport_start + visible_rows).min(total_rows);
+
     let rows: Vec<Row> = app
         .filtered_fits
         .iter()
+        .skip(viewport_start)
+        .take(viewport_end.saturating_sub(viewport_start))
         .map(|&idx| {
             let fit = &app.all_fits[idx];
             let color = fit_color(fit.fit_level, tc);
@@ -375,26 +486,33 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColors) {
 
             let is_pulling = app.pull_active.is_some()
                 && app.pull_model_name.as_deref() == Some(&fit.model.name);
-            let has_ollama = providers::has_ollama_mapping(&fit.model.name);
+            let capability = app.download_capability_for(&fit.model.name);
 
             let installed_icon = if fit.installed {
                 " ✓".to_string()
             } else if is_pulling {
                 pull_indicator(app.pull_percent, app.tick_count)
-            } else if !has_ollama {
-                " —".to_string()
             } else {
-                " ".to_string()
+                match capability {
+                    DownloadCapability::Unknown => " …".to_string(),
+                    DownloadCapability::None => " —".to_string(),
+                    DownloadCapability::Ollama => " O".to_string(),
+                    DownloadCapability::LlamaCpp => " L".to_string(),
+                    DownloadCapability::Both => "OL".to_string(),
+                }
             };
-            #[allow(clippy::if_same_then_else)]
             let installed_color = if fit.installed {
                 tc.good
             } else if is_pulling {
                 tc.warning
-            } else if !has_ollama {
-                tc.muted
             } else {
-                tc.muted
+                match capability {
+                    DownloadCapability::Unknown => tc.muted,
+                    DownloadCapability::None => tc.muted,
+                    DownloadCapability::Ollama
+                    | DownloadCapability::LlamaCpp
+                    | DownloadCapability::Both => tc.info,
+                }
             };
 
             let row_style = if is_pulling {
@@ -474,7 +592,7 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColors) {
 
     let mut state = TableState::default();
     if !app.filtered_fits.is_empty() {
-        state.select(Some(app.selected_row));
+        state.select(Some(app.selected_row.saturating_sub(viewport_start)));
     }
 
     frame.render_stateful_widget(table, area, &mut state);
@@ -568,7 +686,7 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
                 }),
             ),
             Span::styled(
-                format!(" (est. ~{:.1} tok/s)", fit.estimated_tps),
+                format!(" (baseline est. ~{:.1} tok/s)", fit.estimated_tps),
                 Style::default().fg(tc.muted),
             ),
         ]),
@@ -579,14 +697,30 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
                     providers::is_model_installed(&fit.model.name, &app.ollama_installed);
                 let mlx_installed =
                     providers::is_model_installed_mlx(&fit.model.name, &app.mlx_installed);
-                let any_available = app.ollama_available || app.mlx_available;
+                let llamacpp_installed = providers::is_model_installed_llamacpp(
+                    &fit.model.name,
+                    &app.llamacpp_installed,
+                );
+                let any_available =
+                    app.ollama_available || app.mlx_available || app.llamacpp_available;
 
-                if ollama_installed && mlx_installed {
+                if ollama_installed && mlx_installed && llamacpp_installed {
+                    Span::styled(
+                        "✓ Ollama  ✓ MLX  ✓ llama.cpp",
+                        Style::default().fg(tc.good).bold(),
+                    )
+                } else if ollama_installed && mlx_installed {
                     Span::styled("✓ Ollama  ✓ MLX", Style::default().fg(tc.good).bold())
+                } else if ollama_installed && llamacpp_installed {
+                    Span::styled("✓ Ollama  ✓ llama.cpp", Style::default().fg(tc.good).bold())
+                } else if mlx_installed && llamacpp_installed {
+                    Span::styled("✓ MLX  ✓ llama.cpp", Style::default().fg(tc.good).bold())
                 } else if ollama_installed {
                     Span::styled("✓ Ollama", Style::default().fg(tc.good).bold())
                 } else if mlx_installed {
                     Span::styled("✓ MLX", Style::default().fg(tc.good).bold())
+                } else if llamacpp_installed {
+                    Span::styled("✓ llama.cpp", Style::default().fg(tc.good).bold())
                 } else if any_available {
                     Span::styled("✗ No  (press d to pull)", Style::default().fg(tc.muted))
                 } else {
@@ -641,7 +775,7 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
             ),
         ]),
         Line::from(vec![
-            Span::styled("  Est. Speed:  ", Style::default().fg(tc.muted)),
+            Span::styled("  Baseline Est:", Style::default().fg(tc.muted)),
             Span::styled(
                 format!("{:.1} tok/s", fit.estimated_tps),
                 Style::default().fg(tc.fg),
@@ -803,25 +937,316 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
         ]),
     ]);
 
-    lines.push(Line::from(""));
+    // Build right-pane content (GGUF sources + notes)
+    let has_right_pane = !fit.model.gguf_sources.is_empty() || !fit.notes.is_empty();
+
+    let mut right_lines: Vec<Line> = vec![Line::from("")];
+
+    if !fit.model.gguf_sources.is_empty() {
+        right_lines.push(Line::from(Span::styled(
+            "  ── GGUF Downloads ──",
+            Style::default().fg(tc.accent),
+        )));
+        right_lines.push(Line::from(""));
+        for src in &fit.model.gguf_sources {
+            right_lines.push(Line::from(vec![
+                Span::styled(
+                    format!("  📦 {:<12}", src.provider),
+                    Style::default().fg(tc.info),
+                ),
+                Span::styled(format!("hf.co/{}", src.repo), Style::default().fg(tc.fg)),
+            ]));
+        }
+        right_lines.push(Line::from(""));
+        right_lines.push(Line::from(Span::styled(
+            format!("  llmfit download \\"),
+            Style::default().fg(tc.muted),
+        )));
+        right_lines.push(Line::from(Span::styled(
+            format!("    {} \\", fit.model.gguf_sources[0].repo),
+            Style::default().fg(tc.muted),
+        )));
+        right_lines.push(Line::from(Span::styled(
+            format!("    --quant {}", fit.best_quant),
+            Style::default().fg(tc.muted),
+        )));
+        right_lines.push(Line::from(""));
+    }
+
     if !fit.notes.is_empty() {
-        lines.push(Line::from(Span::styled(
+        right_lines.push(Line::from(Span::styled(
             "  ── Notes ──",
             Style::default().fg(tc.accent),
         )));
-        lines.push(Line::from(""));
+        right_lines.push(Line::from(""));
         for note in &fit.notes {
-            lines.push(Line::from(Span::styled(
+            right_lines.push(Line::from(Span::styled(
                 format!("  {}", note),
                 Style::default().fg(tc.fg),
             )));
         }
     }
 
+    // Track the left pane area for cursor positioning
+    let left_area;
+
+    if has_right_pane {
+        // Split into left (model info) and right (downloads + notes) panes
+        let h_layout = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+            .split(area);
+
+        left_area = h_layout[0];
+
+        let left_block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(tc.border))
+            .title(format!(" {} ", fit.model.name))
+            .title_style(Style::default().fg(tc.fg).bold());
+
+        let left_paragraph = Paragraph::new(lines)
+            .block(left_block)
+            .wrap(Wrap { trim: false });
+        frame.render_widget(left_paragraph, h_layout[0]);
+
+        let right_title = if !fit.model.gguf_sources.is_empty() {
+            " 📦 Downloads & Notes "
+        } else {
+            " Notes "
+        };
+        let right_block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(tc.border))
+            .title(right_title)
+            .title_style(Style::default().fg(tc.info).bold());
+
+        let right_paragraph = Paragraph::new(right_lines)
+            .block(right_block)
+            .wrap(Wrap { trim: false });
+        frame.render_widget(right_paragraph, h_layout[1]);
+    } else {
+        left_area = area;
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(tc.border))
+            .title(format!(" {} ", fit.model.name))
+            .title_style(Style::default().fg(tc.fg).bold());
+
+        let paragraph = Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false });
+        frame.render_widget(paragraph, area);
+    }
+
+    if app.input_mode == InputMode::Plan {
+        let (row_offset, label_len) = match app.plan_field {
+            PlanField::Context => (5u16, "  Context:    ".len() as u16),
+            PlanField::Quant => (6u16, "  Quant:      ".len() as u16),
+            PlanField::TargetTps => (7u16, "  Target TPS: ".len() as u16),
+        };
+        let x = left_area.x + 1 + label_len + app.plan_cursor_position as u16;
+        let y = left_area.y + 1 + row_offset;
+        if x < left_area.x + left_area.width.saturating_sub(1)
+            && y < left_area.y + left_area.height.saturating_sub(1)
+        {
+            frame.set_cursor_position((x, y));
+        }
+    }
+}
+
+fn draw_plan(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
+    let Some(model_name) = app.plan_model_name() else {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(tc.border))
+            .title(" Planner ");
+        frame.render_widget(block, area);
+        return;
+    };
+
+    let field_style = |field: PlanField| {
+        if app.input_mode == InputMode::Plan && app.plan_field == field {
+            Style::default()
+                .fg(tc.accent_secondary)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(tc.fg)
+        }
+    };
+
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Model: ", Style::default().fg(tc.muted)),
+            Span::styled(model_name, Style::default().fg(tc.fg).bold()),
+        ]),
+        Line::from(vec![
+            Span::styled("  Note: ", Style::default().fg(tc.muted)),
+            Span::styled(
+                "Estimate-based using current llmfit fit/speed heuristics.",
+                Style::default().fg(tc.warning),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Inputs (editable)",
+            Style::default().fg(tc.accent),
+        )),
+        Line::from(vec![
+            Span::styled("  Context:    ", Style::default().fg(tc.muted)),
+            Span::styled(
+                if app.plan_context_input.is_empty() {
+                    "<required>"
+                } else {
+                    app.plan_context_input.as_str()
+                },
+                field_style(PlanField::Context),
+            ),
+            Span::styled(" tokens", Style::default().fg(tc.muted)),
+        ]),
+        Line::from(vec![
+            Span::styled("  Quant:      ", Style::default().fg(tc.muted)),
+            Span::styled(
+                if app.plan_quant_input.is_empty() {
+                    "<auto>"
+                } else {
+                    app.plan_quant_input.as_str()
+                },
+                field_style(PlanField::Quant),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("  Target TPS: ", Style::default().fg(tc.muted)),
+            Span::styled(
+                if app.plan_target_tps_input.is_empty() {
+                    "<none>"
+                } else {
+                    app.plan_target_tps_input.as_str()
+                },
+                field_style(PlanField::TargetTps),
+            ),
+            Span::styled(" tok/s", Style::default().fg(tc.muted)),
+        ]),
+        Line::from(""),
+    ];
+
+    if let Some(err) = &app.plan_error {
+        lines.push(Line::from(vec![
+            Span::styled("  Error: ", Style::default().fg(tc.error)),
+            Span::styled(err, Style::default().fg(tc.error).bold()),
+        ]));
+    } else if let Some(plan) = &app.plan_estimate {
+        lines.push(Line::from(Span::styled(
+            "  Minimum Hardware",
+            Style::default().fg(tc.accent),
+        )));
+        lines.push(Line::from(vec![
+            Span::styled("  VRAM: ", Style::default().fg(tc.muted)),
+            Span::styled(
+                plan.minimum
+                    .vram_gb
+                    .map(|v| format!("{v:.1} GB"))
+                    .unwrap_or_else(|| "n/a".to_string()),
+                Style::default().fg(tc.fg),
+            ),
+            Span::styled("   RAM: ", Style::default().fg(tc.muted)),
+            Span::styled(
+                format!("{:.1} GB", plan.minimum.ram_gb),
+                Style::default().fg(tc.fg),
+            ),
+            Span::styled("   CPU: ", Style::default().fg(tc.muted)),
+            Span::styled(
+                format!("{} cores", plan.minimum.cpu_cores),
+                Style::default().fg(tc.fg),
+            ),
+        ]));
+        lines.push(Line::from(" "));
+        lines.push(Line::from(Span::styled(
+            "  Recommended Hardware",
+            Style::default().fg(tc.accent),
+        )));
+        lines.push(Line::from(vec![
+            Span::styled("  VRAM: ", Style::default().fg(tc.muted)),
+            Span::styled(
+                plan.recommended
+                    .vram_gb
+                    .map(|v| format!("{v:.1} GB"))
+                    .unwrap_or_else(|| "n/a".to_string()),
+                Style::default().fg(tc.fg),
+            ),
+            Span::styled("   RAM: ", Style::default().fg(tc.muted)),
+            Span::styled(
+                format!("{:.1} GB", plan.recommended.ram_gb),
+                Style::default().fg(tc.fg),
+            ),
+            Span::styled("   CPU: ", Style::default().fg(tc.muted)),
+            Span::styled(
+                format!("{} cores", plan.recommended.cpu_cores),
+                Style::default().fg(tc.fg),
+            ),
+        ]));
+        lines.push(Line::from(" "));
+        lines.push(Line::from(Span::styled(
+            "  Run Paths",
+            Style::default().fg(tc.accent),
+        )));
+
+        for path in &plan.run_paths {
+            let path_color = if path.feasible { tc.good } else { tc.error };
+            let status = if path.feasible { "yes" } else { "no" };
+            lines.push(Line::from(vec![
+                Span::styled("  - ", Style::default().fg(tc.muted)),
+                Span::styled(path.path.label(), Style::default().fg(tc.fg).bold()),
+                Span::styled(": ", Style::default().fg(tc.muted)),
+                Span::styled(status, Style::default().fg(path_color)),
+                Span::styled("  tps=", Style::default().fg(tc.muted)),
+                Span::styled(
+                    path.estimated_tps
+                        .map(|t| format!("{t:.1}"))
+                        .unwrap_or_else(|| "-".to_string()),
+                    Style::default().fg(tc.fg),
+                ),
+                Span::styled("  fit=", Style::default().fg(tc.muted)),
+                Span::styled(
+                    path.fit_level
+                        .map(|f| match f {
+                            FitLevel::Perfect => "Perfect",
+                            FitLevel::Good => "Good",
+                            FitLevel::Marginal => "Marginal",
+                            FitLevel::TooTight => "Too Tight",
+                        })
+                        .unwrap_or("-"),
+                    Style::default().fg(path_color),
+                ),
+            ]));
+        }
+
+        lines.push(Line::from(" "));
+        lines.push(Line::from(Span::styled(
+            "  Upgrade Deltas",
+            Style::default().fg(tc.accent),
+        )));
+        if plan.upgrade_deltas.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "  - none required",
+                Style::default().fg(tc.good),
+            )));
+        } else {
+            for delta in &plan.upgrade_deltas {
+                lines.push(Line::from(Span::styled(
+                    format!("  - {}", delta.description),
+                    Style::default().fg(tc.fg),
+                )));
+            }
+        }
+    }
+
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(tc.border))
-        .title(format!(" {} ", fit.model.name))
+        .title(format!(" Plan: {} ", model_name))
         .title_style(Style::default().fg(tc.fg).bold());
 
     let paragraph = Paragraph::new(lines)
@@ -905,6 +1330,144 @@ fn draw_provider_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
     frame.render_widget(paragraph, popup_area);
 }
 
+fn draw_use_case_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
+    let area = frame.area();
+
+    let max_name_len = app
+        .use_cases
+        .iter()
+        .map(|uc| uc.label().len())
+        .max()
+        .unwrap_or(10);
+    let popup_width = (max_name_len as u16 + 10).min(area.width.saturating_sub(4));
+    let popup_height = (app.use_cases.len() as u16 + 2).min(area.height.saturating_sub(4));
+
+    let x = area.x + (area.width.saturating_sub(popup_width)) / 2;
+    let y = area.y + (area.height.saturating_sub(popup_height)) / 2;
+    let popup_area = Rect::new(x, y, popup_width, popup_height);
+
+    frame.render_widget(Clear, popup_area);
+
+    let inner_height = popup_height.saturating_sub(2) as usize;
+    let total = app.use_cases.len();
+
+    let scroll_offset = if app.use_case_cursor >= inner_height {
+        app.use_case_cursor - inner_height + 1
+    } else {
+        0
+    };
+
+    let lines: Vec<Line> = app
+        .use_cases
+        .iter()
+        .enumerate()
+        .skip(scroll_offset)
+        .take(inner_height)
+        .map(|(i, use_case)| {
+            let checkbox = if app.selected_use_cases[i] {
+                "[x]"
+            } else {
+                "[ ]"
+            };
+            let is_cursor = i == app.use_case_cursor;
+
+            let style = if is_cursor {
+                if app.selected_use_cases[i] {
+                    Style::default()
+                        .fg(tc.good)
+                        .add_modifier(Modifier::BOLD)
+                        .bg(tc.highlight_bg)
+                } else {
+                    Style::default()
+                        .fg(tc.fg)
+                        .add_modifier(Modifier::BOLD)
+                        .bg(tc.highlight_bg)
+                }
+            } else if app.selected_use_cases[i] {
+                Style::default().fg(tc.good)
+            } else {
+                Style::default().fg(tc.muted)
+            };
+
+            Line::from(Span::styled(
+                format!(" {} {}", checkbox, use_case.label()),
+                style,
+            ))
+        })
+        .collect();
+
+    let active_count = app.selected_use_cases.iter().filter(|&&s| s).count();
+    let title = format!(" Use Cases ({}/{}) ", active_count, total);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(tc.accent_secondary))
+        .title(title)
+        .title_style(
+            Style::default()
+                .fg(tc.accent_secondary)
+                .add_modifier(Modifier::BOLD),
+        );
+
+    let paragraph = Paragraph::new(lines).block(block);
+    frame.render_widget(paragraph, popup_area);
+}
+
+fn draw_download_provider_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
+    let area = frame.area();
+    let popup_width = 44.min(area.width.saturating_sub(4));
+    let popup_height = 8.min(area.height.saturating_sub(4));
+
+    let x = area.x + (area.width.saturating_sub(popup_width)) / 2;
+    let y = area.y + (area.height.saturating_sub(popup_height)) / 2;
+    let popup_area = Rect::new(x, y, popup_width, popup_height);
+
+    frame.render_widget(Clear, popup_area);
+
+    let mut lines = Vec::new();
+    if let Some(name) = &app.download_provider_model {
+        lines.push(Line::from(Span::styled(
+            format!(" Model: {}", name),
+            Style::default().fg(tc.muted),
+        )));
+        lines.push(Line::from(""));
+    }
+
+    for (i, provider) in app.download_provider_options.iter().enumerate() {
+        let label = match provider {
+            DownloadProvider::Ollama => "Ollama",
+            DownloadProvider::LlamaCpp => "llama.cpp",
+        };
+        let is_cursor = i == app.download_provider_cursor;
+        let prefix = if is_cursor { ">" } else { " " };
+        let style = if is_cursor {
+            Style::default()
+                .fg(tc.accent_secondary)
+                .add_modifier(Modifier::BOLD)
+                .bg(tc.highlight_bg)
+        } else {
+            Style::default().fg(tc.fg)
+        };
+        lines.push(Line::from(Span::styled(
+            format!(" {} {}", prefix, label),
+            style,
+        )));
+    }
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(tc.accent_secondary))
+        .title(" Download With ")
+        .title_style(
+            Style::default()
+                .fg(tc.accent_secondary)
+                .add_modifier(Modifier::BOLD),
+        );
+
+    let paragraph = Paragraph::new(lines).block(block);
+    frame.render_widget(paragraph, popup_area);
+}
+
 fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
     // If a download is in progress, show the progress bar
     if let Some(status) = &app.pull_status {
@@ -921,7 +1484,9 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
                 } else {
                     "Enter:detail"
                 };
-                let ollama_keys = if app.ollama_available {
+                let any_provider =
+                    app.ollama_available || app.mlx_available || app.llamacpp_available;
+                let ollama_keys = if any_provider {
                     let installed_key = if app.installed_first {
                         "i:all"
                     } else {
@@ -933,7 +1498,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
                 };
                 (
                     format!(
-                        " ↑↓/jk:nav  {}  /:search  f:fit  s:sort  t:theme{}  p:providers  q:quit",
+                        " ↑↓/jk:nav  {}  /:search  f:fit  s:sort  t:theme  p:plan{}  P:providers  U:use cases  q:quit  tok/s*:est",
                         detail_key, ollama_keys,
                     ),
                     "NORMAL",
@@ -943,9 +1508,22 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
                 "  Type to search  Esc:done  Ctrl-U:clear".to_string(),
                 "SEARCH",
             ),
+            InputMode::Plan => (
+                "  Tab/jk:field  ←/→:cursor  type:edit  Backspace/Delete  Ctrl-U:clear  Esc:close"
+                    .to_string(),
+                "PLAN",
+            ),
             InputMode::ProviderPopup => (
                 "  ↑↓/jk:navigate  Space:toggle  a:all/none  Esc:close".to_string(),
                 "PROVIDERS",
+            ),
+            InputMode::UseCasePopup => (
+                "  ↑↓/jk:navigate  Space:toggle  a:all/none  Esc:close".to_string(),
+                "USE CASES",
+            ),
+            InputMode::DownloadProviderPopup => (
+                "  ↑↓/jk:choose  Enter:download  Esc:cancel".to_string(),
+                "DOWNLOAD",
             ),
         };
 
@@ -988,7 +1566,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
             } else {
                 "Enter:detail"
             };
-            let any_provider = app.ollama_available || app.mlx_available;
+            let any_provider = app.ollama_available || app.mlx_available || app.llamacpp_available;
             let ollama_keys = if any_provider {
                 let installed_key = if app.installed_first {
                     "i:all"
@@ -1001,7 +1579,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
             };
             (
                 format!(
-                    " ↑↓/jk:nav  {}  /:search  f:fit  s:sort  t:theme{}  p:providers  q:quit",
+                    " ↑↓/jk:nav  {}  /:search  f:fit  s:sort  t:theme  p:plan{}  P:providers  U:use cases  q:quit  tok/s*:est",
                     detail_key, ollama_keys,
                 ),
                 "NORMAL",
@@ -1011,9 +1589,22 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
             "  Type to search  Esc:done  Ctrl-U:clear".to_string(),
             "SEARCH",
         ),
+        InputMode::Plan => (
+            "  Tab/jk:field  ←/→:cursor  type:edit  Backspace/Delete  Ctrl-U:clear  Esc:close"
+                .to_string(),
+            "PLAN",
+        ),
         InputMode::ProviderPopup => (
             "  ↑↓/jk:navigate  Space:toggle  a:all/none  Esc:close".to_string(),
             "PROVIDERS",
+        ),
+        InputMode::UseCasePopup => (
+            "  ↑↓/jk:navigate  Space:toggle  a:all/none  Esc:close".to_string(),
+            "USE CASES",
+        ),
+        InputMode::DownloadProviderPopup => (
+            "  ↑↓/jk:choose  Enter:download  Esc:cancel".to_string(),
+            "DOWNLOAD",
         ),
     };
 

@@ -12,12 +12,24 @@ Usage:
 
 import argparse
 import json
+import os
 import sys
 import time
 import urllib.request
 import urllib.error
 
 HF_API = "https://huggingface.co/api/models"
+
+# Global auth token, set from --token flag or HF_TOKEN / HUGGING_FACE_HUB_TOKEN env var
+_hf_token: str | None = None
+
+
+def _auth_headers() -> dict[str, str]:
+    """Return HTTP headers with auth if a HuggingFace token is available."""
+    headers = {"User-Agent": "llmfit-scraper/1.0"}
+    if _hf_token:
+        headers["Authorization"] = f"Bearer {_hf_token}"
+    return headers
 
 # Top text-generation models to scrape (owner/repo)
 TARGET_MODELS = [
@@ -66,6 +78,12 @@ TARGET_MODELS = [
     "Qwen/Qwen3-30B-A3B",
     "Qwen/Qwen3-235B-A22B",
     "Qwen/Qwen3-Coder-480B-A35B-Instruct",
+    "Qwen/Qwen3-Coder-Next",
+    # Qwen 3.5 (native multimodal, Feb 2026)
+    "Qwen/Qwen3.5-27B",
+    "Qwen/Qwen3.5-35B-A3B",
+    "Qwen/Qwen3.5-122B-A10B",
+    "Qwen/Qwen3.5-397B-A17B",
     # Microsoft Phi
     "microsoft/phi-3-mini-4k-instruct",
     "microsoft/Phi-3-medium-14b-instruct",
@@ -146,6 +164,34 @@ TARGET_MODELS = [
     # Embeddings (useful for RAG sizing)
     "nomic-ai/nomic-embed-text-v1.5",
     "BAAI/bge-large-en-v1.5",
+    # --- New models added Feb 2026 ---
+    # DeepSeek V3.2 family
+    "deepseek-ai/DeepSeek-V3.2",
+    "deepseek-ai/DeepSeek-V3.2-Speciale",
+    # Zhipu/Z.ai GLM-5
+    "zai-org/GLM-5",
+    # Moonshot Kimi K2.5
+    "moonshotai/Kimi-K2.5",
+    # MiniMax M2.5
+    "MiniMaxAI/MiniMax-M2.5",
+    # Xiaomi MiMo
+    "XiaomiMiMo/MiMo-V2-Flash",
+    "XiaomiMiMo/MiMo-7B-RL",
+    # NVIDIA Nemotron
+    "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+    "nvidia/NVIDIA-Nemotron-Nano-9B-v2",
+    # Microsoft Phi-4 reasoning family
+    "microsoft/Phi-4-reasoning",
+    "microsoft/Phi-4-mini-reasoning",
+    "microsoft/Phi-4-multimodal-instruct",
+    # LG AI EXAONE 4.0
+    "LGAI-EXAONE/EXAONE-4.0-32B",
+    "LGAI-EXAONE/EXAONE-4.0-1.2B",
+    # HuggingFace SmolLM3
+    "HuggingFaceTB/SmolLM3-3B",
+    # Google Gemma 3n (effective parameter models)
+    "google/gemma-3n-E4B-it",
+    "google/gemma-3n-E2B-it",
 ]
 
 # Bytes-per-parameter for different quantization levels
@@ -173,6 +219,10 @@ MOE_CONFIGS = {
     "qwen3_moe": {"num_experts": 128, "active_experts": 8},
     "llama4": {"num_experts": 16, "active_experts": 1},
     "grok": {"num_experts": 8, "active_experts": 2},
+    "glm5": {"num_experts": 256, "active_experts": 8},
+    "minimax_m2": {"num_experts": 32, "active_experts": 2},
+    "mimo_v2": {"num_experts": 128, "active_experts": 8},
+    "nemotron3_nano": {"num_experts": 128, "active_experts": 6},
 }
 
 # Published active parameter counts for well-known MoE models
@@ -183,25 +233,43 @@ MOE_ACTIVE_PARAMS = {
     "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct": 2_400_000_000,
     "deepseek-ai/DeepSeek-V3": 37_000_000_000,
     "deepseek-ai/DeepSeek-R1": 37_000_000_000,
+    "deepseek-ai/DeepSeek-V3.2": 37_000_000_000,
+    "deepseek-ai/DeepSeek-V3.2-Speciale": 37_000_000_000,
     "Qwen/Qwen3-30B-A3B": 3_300_000_000,
     "Qwen/Qwen3-235B-A22B": 22_000_000_000,
     "Qwen/Qwen3-Coder-480B-A35B-Instruct": 35_000_000_000,
+    "Qwen/Qwen3-Coder-Next": 3_000_000_000,
+    "Qwen/Qwen3.5-35B-A3B": 3_000_000_000,
+    "Qwen/Qwen3.5-122B-A10B": 10_000_000_000,
+    "Qwen/Qwen3.5-397B-A17B": 17_000_000_000,
     "meta-llama/Llama-4-Scout-17B-16E-Instruct": 17_000_000_000,
     "meta-llama/Llama-4-Maverick-17B-128E-Instruct": 17_000_000_000,
     "xai-org/grok-1": 86_000_000_000,
     "moonshotai/Kimi-K2-Instruct": 32_000_000_000,
+    "moonshotai/Kimi-K2.5": 32_000_000_000,
+    "zai-org/GLM-5": 40_000_000_000,
+    "MiniMaxAI/MiniMax-M2.5": 10_000_000_000,
+    "XiaomiMiMo/MiMo-V2-Flash": 15_000_000_000,
+    "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16": 3_000_000_000,
+    "Qwen/Qwen3.5-397B-A17B": 17_000_000_000,
+    "Qwen/Qwen3.5-122B-A10B": 10_000_000_000,
+    "Qwen/Qwen3.5-35B-A3B": 3_000_000_000,
 }
 
 
 def fetch_model_info(repo_id: str) -> dict | None:
     """Fetch model info from HuggingFace API."""
     url = f"{HF_API}/{repo_id}"
-    req = urllib.request.Request(url, headers={"User-Agent": "llmfit-scraper/1.0"})
+    req = urllib.request.Request(url, headers=_auth_headers())
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             return json.loads(resp.read().decode())
     except urllib.error.HTTPError as e:
-        print(f"  ⚠ HTTP {e.code} for {repo_id} — skipping", file=sys.stderr)
+        if e.code == 401 and not _hf_token:
+            print(f"  ⚠ HTTP 401 for {repo_id} — model is gated, set HF_TOKEN to access",
+                  file=sys.stderr)
+        else:
+            print(f"  ⚠ HTTP {e.code} for {repo_id} — skipping", file=sys.stderr)
         return None
     except Exception as e:
         print(f"  ⚠ Error fetching {repo_id}: {e}", file=sys.stderr)
@@ -321,25 +389,38 @@ def infer_context_length(config: dict | None) -> int:
     """Try to extract context length from model config."""
     if not config:
         return 4096
+
     # Common config keys for max sequence length
-    for key in [
+    keys_to_check = [
         "max_position_embeddings",
         "max_sequence_length",
         "seq_length",
         "n_positions",
         "sliding_window",
-    ]:
+    ]
+
+    # Check top-level config
+    for key in keys_to_check:
         if key in config:
             val = config[key]
             if isinstance(val, int) and val > 0:
                 return val
+
+    # For multimodal models (e.g., Qwen3.5), check text_config
+    if "text_config" in config and isinstance(config["text_config"], dict):
+        for key in keys_to_check:
+            if key in config["text_config"]:
+                val = config["text_config"][key]
+                if isinstance(val, int) and val > 0:
+                    return val
+
     return 4096
 
 
 def fetch_config_json(repo_id: str) -> dict | None:
     """Fetch the full config.json from a HF repo (has max_position_embeddings)."""
     url = f"https://huggingface.co/{repo_id}/resolve/main/config.json"
-    req = urllib.request.Request(url, headers={"User-Agent": "llmfit-scraper/1.0"})
+    req = urllib.request.Request(url, headers=_auth_headers())
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
             return json.loads(resp.read().decode())
@@ -438,6 +519,121 @@ def scrape_model(repo_id: str) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
+# GGUF source enrichment — find pre-quantized GGUF repos for known models
+# ---------------------------------------------------------------------------
+
+# Providers known to publish high-quality GGUF quantizations
+GGUF_PROVIDERS = ["unsloth", "bartowski"]
+
+GGUF_CACHE_FILE = os.path.join(os.path.dirname(__file__), "..", "data", "gguf_sources_cache.json")
+GGUF_CACHE_MAX_AGE_DAYS = 7  # Re-check repos older than this
+
+
+def _load_gguf_cache() -> dict:
+    """Load the GGUF source cache from disk.
+
+    Returns dict mapping model repo_id -> {"sources": [...], "checked": ISO timestamp}
+    """
+    try:
+        with open(GGUF_CACHE_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _save_gguf_cache(cache: dict):
+    """Save the GGUF source cache to disk."""
+    os.makedirs(os.path.dirname(GGUF_CACHE_FILE), exist_ok=True)
+    with open(GGUF_CACHE_FILE, "w") as f:
+        json.dump(cache, f, indent=2)
+
+
+def _cache_entry_fresh(entry: dict) -> bool:
+    """Check if a cache entry is still valid."""
+    try:
+        from datetime import datetime, timedelta, timezone
+        checked = datetime.fromisoformat(entry["checked"])
+        return (datetime.now(timezone.utc) - checked) < timedelta(days=GGUF_CACHE_MAX_AGE_DAYS)
+    except (KeyError, ValueError):
+        return False
+
+
+def _model_gguf_repo_candidates(repo_id: str) -> list[tuple[str, str]]:
+    """Generate candidate GGUF repo names for a model.
+
+    Returns list of (provider, candidate_repo_id) tuples.
+    e.g. for "meta-llama/Llama-3.1-8B-Instruct" →
+         [("unsloth", "unsloth/Llama-3.1-8B-Instruct-GGUF"),
+          ("bartowski", "bartowski/Llama-3.1-8B-Instruct-GGUF")]
+    """
+    model_name = repo_id.split("/")[-1]
+    candidates = []
+    for provider in GGUF_PROVIDERS:
+        candidates.append((provider, f"{provider}/{model_name}-GGUF"))
+    return candidates
+
+
+def check_gguf_repo_exists(repo_id: str) -> bool:
+    """Check if a HuggingFace repo exists and has GGUF files."""
+    url = f"{HF_API}/{repo_id}"
+    req = urllib.request.Request(url, headers=_auth_headers())
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            info = json.loads(resp.read().decode())
+            tags = info.get("tags", [])
+            return "gguf" in tags
+    except Exception:
+        return False
+
+
+def enrich_gguf_sources(models: list[dict]) -> int:
+    """Add gguf_sources to models by checking GGUF provider repos.
+
+    Uses a persistent cache to avoid re-checking repos on every scrape.
+    Returns the number of models enriched.
+    """
+    cache = _load_gguf_cache()
+    enriched = 0
+    cache_hits = 0
+    total = len(models)
+    from datetime import datetime, timezone
+
+    for i, model in enumerate(models, 1):
+        repo_id = model["name"]
+
+        # Check cache first
+        if repo_id in cache and _cache_entry_fresh(cache[repo_id]):
+            sources = cache[repo_id]["sources"]
+            cache_hits += 1
+        else:
+            # Query HuggingFace
+            candidates = _model_gguf_repo_candidates(repo_id)
+            sources = []
+            for provider, candidate_repo in candidates:
+                print(f"  [{i}/{total}] Checking {candidate_repo}...", end="")
+                if check_gguf_repo_exists(candidate_repo):
+                    sources.append({"repo": candidate_repo, "provider": provider})
+                    print(" ✓")
+                else:
+                    print(" ✗")
+                time.sleep(0.15)  # Be polite to the API
+
+            # Update cache
+            cache[repo_id] = {
+                "sources": sources,
+                "checked": datetime.now(timezone.utc).isoformat(),
+            }
+
+        if sources:
+            model["gguf_sources"] = sources
+            enriched += 1
+
+    _save_gguf_cache(cache)
+    print(f"  Cache: {cache_hits} hits, {total - cache_hits} API checks")
+    return enriched
+
+
+# ---------------------------------------------------------------------------
 # Auto-discovery from HuggingFace trending / most-downloaded
 # ---------------------------------------------------------------------------
 
@@ -476,7 +672,7 @@ def discover_trending_models(limit: int = 30, min_downloads: int = 10000) -> lis
             f"direction=-1&"
             f"limit={fetch_limit}"
         )
-        req = urllib.request.Request(url, headers={"User-Agent": "llmfit-scraper/1.0"})
+        req = urllib.request.Request(url, headers=_auth_headers())
         try:
             with urllib.request.urlopen(req, timeout=30) as resp:
                 models = json.loads(resp.read().decode())
@@ -546,7 +742,34 @@ def main():
         "--min-downloads", type=int, default=10000,
         help="Minimum download count for discovered models (default: 10000)."
     )
+    parser.add_argument(
+        "--gguf-sources", action="store_true", default=True,
+        help="Enrich models with known GGUF download sources from "
+             "providers like unsloth and bartowski on HuggingFace (default: enabled)."
+    )
+    parser.add_argument(
+        "--no-gguf-sources", action="store_false", dest="gguf_sources",
+        help="Skip GGUF download source enrichment (faster scrape)."
+    )
+    parser.add_argument(
+        "--token", type=str, default=None,
+        help="HuggingFace API token for accessing gated models. "
+             "Can also be set via HF_TOKEN or HUGGING_FACE_HUB_TOKEN env var."
+    )
     args = parser.parse_args()
+
+    # Resolve auth token: CLI flag > HF_TOKEN > HUGGING_FACE_HUB_TOKEN
+    global _hf_token
+    _hf_token = (
+        args.token
+        or os.environ.get("HF_TOKEN")
+        or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    )
+    if _hf_token:
+        print(f"🔑 Authenticated with HuggingFace token ({_hf_token[:4]}...{_hf_token[-4:]})")
+    else:
+        print("ℹ  No HF token set. Gated models will use fallback data.")
+        print("   Set HF_TOKEN env var or pass --token to access gated models.\n")
 
     # Fallback entries for gated/auth-required models where the API
     # doesn't return safetensors metadata without a token.
@@ -978,6 +1201,242 @@ def main():
             "pipeline_tag": "text-generation", "architecture": "qwen3",
             "hf_downloads": 0, "hf_likes": 0, "release_date": None,
         },
+        # --- New fallbacks added Feb 2026 ---
+        {
+            "name": "deepseek-ai/DeepSeek-V3.2",
+            "provider": "DeepSeek", "parameter_count": "685B",
+            "parameters_raw": 685000000000,
+            "min_ram_gb": 383.2, "recommended_ram_gb": 638.7, "min_vram_gb": 351.3,
+            "quantization": "Q4_K_M", "context_length": 131072,
+            "use_case": "State-of-the-art, MoE architecture",
+            "pipeline_tag": "text-generation", "architecture": "deepseek_v3",
+            "is_moe": True, "num_experts": 256, "active_experts": 8,
+            "active_parameters": 37000000000,
+            "hf_downloads": 0, "hf_likes": 0, "release_date": "2025-12-01",
+        },
+        {
+            "name": "deepseek-ai/DeepSeek-V3.2-Speciale",
+            "provider": "DeepSeek", "parameter_count": "685B",
+            "parameters_raw": 685000000000,
+            "min_ram_gb": 383.2, "recommended_ram_gb": 638.7, "min_vram_gb": 351.3,
+            "quantization": "Q4_K_M", "context_length": 131072,
+            "use_case": "Advanced reasoning, chain-of-thought",
+            "pipeline_tag": "text-generation", "architecture": "deepseek_v3",
+            "is_moe": True, "num_experts": 256, "active_experts": 8,
+            "active_parameters": 37000000000,
+            "hf_downloads": 0, "hf_likes": 0, "release_date": "2025-12-01",
+        },
+        {
+            "name": "zai-org/GLM-5",
+            "provider": "Zhipu AI", "parameter_count": "744B",
+            "parameters_raw": 744000000000,
+            "min_ram_gb": 416.2, "recommended_ram_gb": 693.6, "min_vram_gb": 381.4,
+            "quantization": "Q4_K_M", "context_length": 200000,
+            "use_case": "State-of-the-art, MoE architecture",
+            "pipeline_tag": "text-generation", "architecture": "glm",
+            "is_moe": True, "num_experts": 256, "active_experts": 8,
+            "active_parameters": 40000000000,
+            "hf_downloads": 0, "hf_likes": 0, "release_date": "2026-02-11",
+        },
+        {
+            "name": "moonshotai/Kimi-K2.5",
+            "provider": "Moonshot", "parameter_count": "171B",
+            "parameters_raw": 171000000000,
+            "min_ram_gb": 95.6, "recommended_ram_gb": 159.4, "min_vram_gb": 87.7,
+            "quantization": "Q4_K_M", "context_length": 262144,
+            "use_case": "Multimodal, vision and text",
+            "pipeline_tag": "image-text-to-text", "architecture": "kimi",
+            "hf_downloads": 0, "hf_likes": 0, "release_date": "2026-01-26",
+        },
+        {
+            "name": "MiniMaxAI/MiniMax-M2.5",
+            "provider": "MiniMax", "parameter_count": "230B",
+            "parameters_raw": 230000000000,
+            "min_ram_gb": 128.6, "recommended_ram_gb": 214.4, "min_vram_gb": 117.9,
+            "quantization": "Q4_K_M", "context_length": 131072,
+            "use_case": "Coding, agentic tool use",
+            "pipeline_tag": "text-generation", "architecture": "minimax",
+            "is_moe": True, "num_experts": 32, "active_experts": 2,
+            "active_parameters": 10000000000,
+            "hf_downloads": 0, "hf_likes": 0, "release_date": "2026-02-11",
+        },
+        {
+            "name": "XiaomiMiMo/MiMo-V2-Flash",
+            "provider": "Xiaomi", "parameter_count": "309B",
+            "parameters_raw": 309000000000,
+            "min_ram_gb": 172.8, "recommended_ram_gb": 288.0, "min_vram_gb": 158.4,
+            "quantization": "Q4_K_M", "context_length": 131072,
+            "use_case": "Efficient reasoning, coding",
+            "pipeline_tag": "text-generation", "architecture": "mimo",
+            "is_moe": True, "num_experts": 128, "active_experts": 8,
+            "active_parameters": 15000000000,
+            "hf_downloads": 0, "hf_likes": 0, "release_date": "2025-12-01",
+        },
+        {
+            "name": "XiaomiMiMo/MiMo-7B-RL",
+            "provider": "Xiaomi", "parameter_count": "7.0B",
+            "parameters_raw": 7000000000,
+            "min_ram_gb": 3.9, "recommended_ram_gb": 6.5, "min_vram_gb": 3.6,
+            "quantization": "Q4_K_M", "context_length": 32768,
+            "use_case": "Advanced reasoning, math and code",
+            "pipeline_tag": "text-generation", "architecture": "mimo",
+            "hf_downloads": 0, "hf_likes": 0, "release_date": "2025-05-01",
+        },
+        {
+            "name": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+            "provider": "NVIDIA", "parameter_count": "30B",
+            "parameters_raw": 30000000000,
+            "min_ram_gb": 16.8, "recommended_ram_gb": 28.0, "min_vram_gb": 15.4,
+            "quantization": "Q4_K_M", "context_length": 1048576,
+            "use_case": "Efficient MoE, agentic tasks",
+            "pipeline_tag": "text-generation", "architecture": "nemotron",
+            "is_moe": True, "num_experts": 128, "active_experts": 6,
+            "active_parameters": 3000000000,
+            "hf_downloads": 0, "hf_likes": 0, "release_date": "2025-06-01",
+        },
+        {
+            "name": "nvidia/NVIDIA-Nemotron-Nano-9B-v2",
+            "provider": "NVIDIA", "parameter_count": "9B",
+            "parameters_raw": 9000000000,
+            "min_ram_gb": 5.0, "recommended_ram_gb": 8.4, "min_vram_gb": 4.6,
+            "quantization": "Q4_K_M", "context_length": 131072,
+            "use_case": "Hybrid Mamba2, reasoning",
+            "pipeline_tag": "text-generation", "architecture": "nemotron",
+            "hf_downloads": 0, "hf_likes": 0, "release_date": "2025-06-01",
+        },
+        {
+            "name": "microsoft/Phi-4-reasoning",
+            "provider": "Microsoft", "parameter_count": "14B",
+            "parameters_raw": 14000000000,
+            "min_ram_gb": 7.8, "recommended_ram_gb": 13.0, "min_vram_gb": 7.2,
+            "quantization": "Q4_K_M", "context_length": 32768,
+            "use_case": "Advanced reasoning, math and code",
+            "pipeline_tag": "text-generation", "architecture": "phi4",
+            "hf_downloads": 0, "hf_likes": 0, "release_date": "2025-04-01",
+        },
+        {
+            "name": "microsoft/Phi-4-mini-reasoning",
+            "provider": "Microsoft", "parameter_count": "3.8B",
+            "parameters_raw": 3800000000,
+            "min_ram_gb": 2.1, "recommended_ram_gb": 3.5, "min_vram_gb": 1.9,
+            "quantization": "Q4_K_M", "context_length": 16384,
+            "use_case": "Lightweight reasoning",
+            "pipeline_tag": "text-generation", "architecture": "phi4",
+            "hf_downloads": 0, "hf_likes": 0, "release_date": "2025-04-01",
+        },
+        {
+            "name": "microsoft/Phi-4-multimodal-instruct",
+            "provider": "Microsoft", "parameter_count": "14B",
+            "parameters_raw": 14000000000,
+            "min_ram_gb": 7.8, "recommended_ram_gb": 13.0, "min_vram_gb": 7.2,
+            "quantization": "Q4_K_M", "context_length": 131072,
+            "use_case": "Multimodal, vision and audio",
+            "pipeline_tag": "image-text-to-text", "architecture": "phi4",
+            "hf_downloads": 0, "hf_likes": 0, "release_date": "2025-04-01",
+        },
+        {
+            "name": "LGAI-EXAONE/EXAONE-4.0-32B",
+            "provider": "LG AI", "parameter_count": "32B",
+            "parameters_raw": 32000000000,
+            "min_ram_gb": 17.9, "recommended_ram_gb": 29.8, "min_vram_gb": 16.4,
+            "quantization": "Q4_K_M", "context_length": 131072,
+            "use_case": "Hybrid reasoning, multilingual",
+            "pipeline_tag": "text-generation", "architecture": "exaone",
+            "hf_downloads": 0, "hf_likes": 0, "release_date": "2025-07-15",
+        },
+        {
+            "name": "LGAI-EXAONE/EXAONE-4.0-1.2B",
+            "provider": "LG AI", "parameter_count": "1.2B",
+            "parameters_raw": 1200000000,
+            "min_ram_gb": 0.7, "recommended_ram_gb": 1.1, "min_vram_gb": 0.6,
+            "quantization": "Q4_K_M", "context_length": 32768,
+            "use_case": "Lightweight, on-device",
+            "pipeline_tag": "text-generation", "architecture": "exaone",
+            "hf_downloads": 0, "hf_likes": 0, "release_date": "2025-07-15",
+        },
+        {
+            "name": "HuggingFaceTB/SmolLM3-3B",
+            "provider": "HuggingFace", "parameter_count": "3B",
+            "parameters_raw": 3000000000,
+            "min_ram_gb": 1.7, "recommended_ram_gb": 2.8, "min_vram_gb": 1.5,
+            "quantization": "Q4_K_M", "context_length": 131072,
+            "use_case": "Lightweight, multilingual reasoning",
+            "pipeline_tag": "text-generation", "architecture": "smollm",
+            "hf_downloads": 0, "hf_likes": 0, "release_date": "2025-07-08",
+        },
+        {
+            "name": "google/gemma-3n-E4B-it",
+            "provider": "Google", "parameter_count": "8B",
+            "parameters_raw": 8000000000,
+            "min_ram_gb": 4.5, "recommended_ram_gb": 7.5, "min_vram_gb": 4.1,
+            "quantization": "Q4_K_M", "context_length": 131072,
+            "use_case": "Multimodal, on-device (effective 4B)",
+            "pipeline_tag": "image-text-to-text", "architecture": "gemma3n",
+            "hf_downloads": 0, "hf_likes": 0, "release_date": "2025-06-25",
+        },
+        {
+            "name": "google/gemma-3n-E2B-it",
+            "provider": "Google", "parameter_count": "4B",
+            "parameters_raw": 4000000000,
+            "min_ram_gb": 2.2, "recommended_ram_gb": 3.7, "min_vram_gb": 2.1,
+            "quantization": "Q4_K_M", "context_length": 131072,
+            "use_case": "Multimodal, on-device (effective 2B)",
+            "pipeline_tag": "image-text-to-text", "architecture": "gemma3n",
+            "hf_downloads": 0, "hf_likes": 0, "release_date": "2025-06-25",
+        },
+        # Qwen3-Coder-Next (80B MoE, 3B active, Jan 2026)
+        {
+            "name": "Qwen/Qwen3-Coder-Next",
+            "provider": "Alibaba", "parameter_count": "80B",
+            "parameters_raw": 80000000000,
+            "min_ram_gb": 44.8, "recommended_ram_gb": 74.6, "min_vram_gb": 41.0,
+            "quantization": "Q4_K_M", "context_length": 262144,
+            "use_case": "Code generation, agentic coding",
+            "pipeline_tag": "text-generation", "architecture": "qwen3_next",
+            "is_moe": True, "num_experts": 64, "active_experts": 4,
+            "active_parameters": 3000000000,
+            "hf_downloads": 0, "hf_likes": 0, "release_date": "2026-01-30",
+        },
+        {
+            "name": "Qwen/Qwen3.5-27B",
+            "provider": "Alibaba", "parameter_count": "27.8B",
+            "parameters_raw": 27781427952,
+            "min_ram_gb": 15.5, "recommended_ram_gb": 25.9, "min_vram_gb": 14.2,
+            "quantization": "Q4_K_M", "context_length": 262144,
+            "use_case": "Multimodal, vision and text",
+            "pipeline_tag": "image-text-to-text", "architecture": "qwen3_5",
+            "hf_downloads": 0, "hf_likes": 0, "release_date": None,
+        },
+        {
+            "name": "Qwen/Qwen3.5-35B-A3B",
+            "provider": "Alibaba", "parameter_count": "36.0B",
+            "parameters_raw": 35951822704,
+            "min_ram_gb": 20.1, "recommended_ram_gb": 33.5, "min_vram_gb": 18.4,
+            "quantization": "Q4_K_M", "context_length": 262144,
+            "use_case": "Multimodal, vision and text",
+            "pipeline_tag": "image-text-to-text", "architecture": "qwen3_5_moe",
+            "hf_downloads": 0, "hf_likes": 0, "release_date": None,
+        },
+        {
+            "name": "Qwen/Qwen3.5-122B-A10B",
+            "provider": "Alibaba", "parameter_count": "125.1B",
+            "parameters_raw": 125086497008,
+            "min_ram_gb": 69.9, "recommended_ram_gb": 116.5, "min_vram_gb": 64.1,
+            "quantization": "Q4_K_M", "context_length": 262144,
+            "use_case": "Multimodal, vision and text",
+            "pipeline_tag": "image-text-to-text", "architecture": "qwen3_5_moe",
+            "hf_downloads": 0, "hf_likes": 0, "release_date": None,
+        },
+        {
+            "name": "Qwen/Qwen3.5-397B-A17B",
+            "provider": "Alibaba", "parameter_count": "403.4B",
+            "parameters_raw": 403397928944,
+            "min_ram_gb": 225.4, "recommended_ram_gb": 375.7, "min_vram_gb": 206.6,
+            "quantization": "Q4_K_M", "context_length": 262144,
+            "use_case": "Multimodal, vision and text",
+            "pipeline_tag": "image-text-to-text", "architecture": "qwen3_5_moe",
+            "hf_downloads": 0, "hf_likes": 0, "release_date": None,
+        },
     ]
 
     print(f"Scraping {len(TARGET_MODELS)} curated models from HuggingFace...\n")
@@ -1034,16 +1493,23 @@ def main():
     # Sort by parameter count
     results.sort(key=lambda m: m["parameters_raw"])
 
-    output_path = "data/hf_models.json"
-    import os
-    os.makedirs("data", exist_ok=True)
+    # Enrich with GGUF download sources if requested
+    gguf_enriched = 0
+    if args.gguf_sources:
+        print(f"\nEnriching {len(results)} models with GGUF download sources...")
+        gguf_enriched = enrich_gguf_sources(results)
+        print(f"  Found GGUF sources for {gguf_enriched} models")
 
-    with open(output_path, "w") as f:
-        json.dump(results, f, indent=2)
+    # Write to both locations: repo root (for reference) and llmfit-core (compiled into binary)
+    output_paths = ["data/hf_models.json", "llmfit-core/data/hf_models.json"]
+    for output_path in output_paths:
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        with open(output_path, "w") as f:
+            json.dump(results, f, indent=2)
 
-    print(f"\n✅ Wrote {len(results)} models to {output_path}")
+    print(f"\n✅ Wrote {len(results)} models to {', '.join(output_paths)}")
     print(f"   Curated: {len(TARGET_MODELS)}, Fallbacks: {fallback_count}, "
-          f"Discovered: {discovered_count}")
+          f"Discovered: {discovered_count}, GGUF-sourced: {gguf_enriched}")
 
     # Print summary table
     print(f"\n{'Model':<50} {'Params':>8} {'Min RAM':>8} {'Rec RAM':>8} {'VRAM':>6}")

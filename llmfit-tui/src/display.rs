@@ -2,6 +2,7 @@ use colored::*;
 use llmfit_core::fit::{FitLevel, ModelFit};
 use llmfit_core::hardware::SystemSpecs;
 use llmfit_core::models::LlmModel;
+use llmfit_core::plan::PlanEstimate;
 use tabled::{Table, Tabled, settings::Style};
 
 #[derive(Tabled)]
@@ -16,7 +17,7 @@ struct ModelRow {
     size: String,
     #[tabled(rename = "Score")]
     score: String,
-    #[tabled(rename = "tok/s")]
+    #[tabled(rename = "tok/s est.")]
     tps: String,
     #[tabled(rename = "Quant")]
     quant: String,
@@ -90,6 +91,9 @@ pub fn display_model_fits(fits: &[ModelFit]) {
 
     let table = Table::new(rows).with(Style::rounded()).to_string();
     println!("{}", table);
+    println!(
+        "  Note: tok/s values are baseline estimates; real runtime depends on engine/runtime."
+    );
 }
 
 pub fn display_model_detail(fit: &ModelFit) {
@@ -110,7 +114,7 @@ pub fn display_model_detail(fit: &ModelFit) {
         println!("{}: {}", "Released".bold(), date);
     }
     println!(
-        "{}: {} (est. ~{:.1} tok/s)",
+        "{}: {} (baseline est. ~{:.1} tok/s)",
         "Runtime".bold(),
         fit.runtime_text(),
         fit.estimated_tps
@@ -126,7 +130,7 @@ pub fn display_model_detail(fit: &ModelFit) {
         fit.score_components.fit,
         fit.score_components.context
     );
-    println!("  Estimated Speed: {:.1} tok/s", fit.estimated_tps);
+    println!("  Baseline Est. Speed: {:.1} tok/s", fit.estimated_tps);
     println!();
 
     println!("{}", "Resource Requirements:".bold().underline());
@@ -181,6 +185,22 @@ pub fn display_model_detail(fit: &ModelFit) {
         fit.utilization_pct, fit.memory_required_gb, fit.memory_available_gb
     );
     println!();
+
+    if !fit.model.gguf_sources.is_empty() {
+        println!("{}", "GGUF Downloads:".bold().underline());
+        for src in &fit.model.gguf_sources {
+            println!("  {} → https://huggingface.co/{}", src.provider, src.repo);
+        }
+        println!(
+            "  {}",
+            format!(
+                "Tip: llmfit download {} --quant {}",
+                fit.model.gguf_sources[0].repo, fit.best_quant
+            )
+            .dimmed()
+        );
+        println!();
+    }
 
     if !fit.notes.is_empty() {
         println!("{}", "Notes:".bold().underline());
@@ -315,7 +335,85 @@ fn fit_to_json(fit: &ModelFit) -> serde_json::Value {
         "memory_available_gb": round2(fit.memory_available_gb),
         "utilization_pct": round1(fit.utilization_pct),
         "notes": fit.notes,
+        "gguf_sources": fit.model.gguf_sources,
     })
+}
+
+pub fn display_model_plan(plan: &PlanEstimate) {
+    println!("\n{}", "=== Hardware Planning Estimate ===".bold().cyan());
+    println!("{} {}", "Model:".bold(), plan.model_name);
+    println!("{} {}", "Provider:".bold(), plan.provider);
+    println!("{} {}", "Context:".bold(), plan.context);
+    println!("{} {}", "Quantization:".bold(), plan.quantization);
+    if let Some(tps) = plan.target_tps {
+        println!("{} {:.1} tok/s", "Target TPS:".bold(), tps);
+    }
+    println!("{} {}", "Note:".bold(), plan.estimate_notice);
+    println!();
+
+    println!("{}", "Minimum Hardware:".bold().underline());
+    println!(
+        "  VRAM: {}",
+        plan.minimum
+            .vram_gb
+            .map(|v| format!("{v:.1} GB"))
+            .unwrap_or_else(|| "Not required".to_string())
+    );
+    println!("  RAM: {:.1} GB", plan.minimum.ram_gb);
+    println!("  CPU Cores: {}", plan.minimum.cpu_cores);
+    println!();
+
+    println!("{}", "Recommended Hardware:".bold().underline());
+    println!(
+        "  VRAM: {}",
+        plan.recommended
+            .vram_gb
+            .map(|v| format!("{v:.1} GB"))
+            .unwrap_or_else(|| "Not required".to_string())
+    );
+    println!("  RAM: {:.1} GB", plan.recommended.ram_gb);
+    println!("  CPU Cores: {}", plan.recommended.cpu_cores);
+    println!();
+
+    println!("{}", "Feasible Run Paths:".bold().underline());
+    for path in &plan.run_paths {
+        println!(
+            "  {}: {}",
+            path.path.label(),
+            if path.feasible { "Yes" } else { "No" }
+        );
+        if let Some(min) = &path.minimum {
+            println!(
+                "    min: VRAM={} RAM={:.1} GB cores={}",
+                min.vram_gb
+                    .map(|v| format!("{v:.1} GB"))
+                    .unwrap_or_else(|| "n/a".to_string()),
+                min.ram_gb,
+                min.cpu_cores
+            );
+        }
+        if let Some(tps) = path.estimated_tps {
+            println!("    est speed: {:.1} tok/s", tps);
+        }
+    }
+    println!();
+
+    println!("{}", "Upgrade Deltas:".bold().underline());
+    if plan.upgrade_deltas.is_empty() {
+        println!("  None required for the selected target.");
+    } else {
+        for delta in &plan.upgrade_deltas {
+            println!("  {}", delta.description);
+        }
+    }
+    println!();
+}
+
+pub fn display_json_plan(plan: &PlanEstimate) {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(plan).expect("JSON serialization failed")
+    );
 }
 
 fn round1(v: f64) -> f64 {

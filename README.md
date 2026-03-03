@@ -4,13 +4,13 @@
   <img src="assets/icon.svg" alt="llmfit icon" width="128" height="128">
 </p>
 
-**206 models. 57 providers. One command to find what runs on your hardware.**
+**Hundreds of models & providers. One command to find what runs on your hardware.**
 
 A terminal tool that right-sizes LLM models to your system's RAM, CPU, and GPU. Detects your hardware, scores each model across quality, speed, fit, and context dimensions, and tells you which ones will actually run well on your machine.
 
-Ships with an interactive TUI (default) and a classic CLI mode. Supports multi-GPU setups, MoE architectures, dynamic quantization selection, and speed estimation.
+Ships with an interactive TUI (default) and a classic CLI mode. Supports multi-GPU setups, MoE architectures, dynamic quantization selection, speed estimation, and local runtime providers (Ollama, llama.cpp, MLX).
 
-> **Sister project:** Check out [kubeclaw](https://github.com/AlexsJones/kubeclaw/) for managing agents in Kubernetes.
+> **Sister project:** Check out [sympozium](https://github.com/AlexsJones/sympozium/) for managing agents in Kubernetes.
 
 ### Quick install (macOS / Linux)
 
@@ -21,9 +21,13 @@ _Downloads the latest release binary from GitHub and installs it to `/usr/local/
 
 Or
 ```sh
-brew tap AlexsJones/llmfit
 brew install llmfit
 ```
+
+Windows users: see the **Install** section below.
+
+![demo](demo.gif)
+
 ---
 
 ## Install
@@ -41,7 +45,6 @@ If `cargo` is not installed yet, install Rust via [rustup](https://rustup.rs/).
 #### Homebrew
 
 ```sh
-brew tap AlexsJones/llmfit
 brew install llmfit
 ```
 
@@ -87,17 +90,39 @@ Launches the interactive terminal UI. Your system specs (CPU, RAM, GPU name, VRA
 | `Esc` or `Enter` | Exit search mode |
 | `Ctrl-U` | Clear search |
 | `f` | Cycle fit filter: All, Runnable, Perfect, Good, Marginal |
+| `a` | Cycle availability filter: All, GGUF Avail, Installed |
 | `s` | Cycle sort column: Score, Params, Mem%, Ctx, Date, Use Case |
 | `t` | Cycle color theme (saved automatically) |
-| `p` | Open provider filter popup |
-| `i` | Toggle installed-first sorting (Ollama only) |
-| `d` | Pull/download selected model via Ollama |
-| `r` | Refresh installed models from Ollama |
+| `p` | Open Plan mode for selected model (hardware planning) |
+| `P` | Open provider filter popup |
+| `i` | Toggle installed-first sorting (any detected runtime provider) |
+| `d` | Download selected model (provider picker when multiple are available) |
+| `r` | Refresh installed models from runtime providers |
 | `1`-`9` | Toggle provider visibility |
 | `Enter` | Toggle detail view for selected model |
 | `PgUp` / `PgDn` | Scroll by 10 |
 | `g` / `G` | Jump to top / bottom |
 | `q` | Quit |
+
+### TUI Plan mode (`p`)
+
+Plan mode inverts normal fit analysis: instead of asking "what fits my hardware?", it estimates "what hardware is needed for this model config?".
+
+Use `p` on a selected row, then:
+
+| Key | Action |
+|---|---|
+| `Tab` / `j` / `k` | Move between editable fields (Context, Quant, Target TPS) |
+| `Left` / `Right` | Move cursor in current field |
+| Type | Edit current field |
+| `Backspace` / `Delete` | Remove characters |
+| `Ctrl-U` | Clear current field |
+| `Esc` or `q` | Exit Plan mode |
+
+Plan mode shows estimate-based:
+- minimum and recommended VRAM/RAM/CPU cores
+- feasible run paths (GPU, CPU offload, CPU-only)
+- upgrade deltas to reach better fit targets
 
 ### Themes
 
@@ -140,6 +165,11 @@ llmfit recommend --json --limit 5
 
 # Recommendations filtered by use case
 llmfit recommend --json --use-case coding --limit 3
+
+# Plan required hardware for a specific model configuration
+llmfit plan "Qwen/Qwen3-4B-MLX-4bit" --context 8192
+llmfit plan "Qwen/Qwen3-4B-MLX-4bit" --context 8192 --quant mlx-4bit
+llmfit plan "Qwen/Qwen3-4B-MLX-4bit" --context 8192 --target-tps 25 --json
 ```
 
 ### GPU memory override
@@ -163,6 +193,21 @@ llmfit --memory=24G recommend --json
 
 Accepted suffixes: `G`/`GB`/`GiB` (gigabytes), `M`/`MB`/`MiB` (megabytes), `T`/`TB`/`TiB` (terabytes). Case-insensitive. If no GPU was detected, the override creates a synthetic GPU entry so models are scored for GPU inference.
 
+### Context-length cap for estimation
+
+Use `--max-context` to cap context length used for memory estimation (without changing each model's advertised maximum context):
+
+```sh
+# Estimate memory fit at 4K context
+llmfit --max-context 4096 --cli
+
+# Works with subcommands
+llmfit --max-context 8192 fit --perfect -n 5
+llmfit --max-context 16384 recommend --json --limit 5
+```
+
+If `--max-context` is not set, llmfit will use `OLLAMA_CONTEXT_LENGTH` when available.
+
 ### JSON output
 
 Add `--json` to any subcommand for machine-readable output:
@@ -171,7 +216,14 @@ Add `--json` to any subcommand for machine-readable output:
 llmfit --json system     # Hardware specs as JSON
 llmfit --json fit -n 10  # Top 10 fits as JSON
 llmfit recommend --json  # Top 5 recommendations (JSON is default for recommend)
+llmfit plan "Qwen/Qwen2.5-Coder-0.5B-Instruct" --context 8192 --json
 ```
+
+`plan` JSON includes stable fields for:
+- request (`context`, `quantization`, `target_tps`)
+- estimated minimum/recommended hardware
+- per-path feasibility (`gpu`, `cpu_offload`, `cpu_only`)
+- upgrade deltas
 
 ---
 
@@ -182,9 +234,10 @@ llmfit recommend --json  # Top 5 recommendations (JSON is default for recommend)
    - **AMD** -- Detected via `rocm-smi`.
    - **Intel Arc** -- Discrete VRAM via sysfs, integrated via `lspci`.
    - **Apple Silicon** -- Unified memory via `system_profiler`. VRAM = system RAM.
-   - **Backend detection** -- Automatically identifies the acceleration backend (CUDA, Metal, ROCm, SYCL, CPU ARM, CPU x86) for speed estimation.
+   - **Ascend** -- Detected via `npu-smi`.
+   - **Backend detection** -- Automatically identifies the acceleration backend (CUDA, Metal, ROCm, SYCL, CPU ARM, CPU x86, Ascend) for speed estimation.
 
-2. **Model database** -- 206 models sourced from the HuggingFace API, stored in `data/hf_models.json` and embedded at compile time. Memory requirements are computed from parameter counts across a quantization hierarchy (Q8_0 through Q2_K). VRAM is the primary constraint for GPU inference; system RAM is the fallback for CPU-only execution.
+2. **Model database** -- Hundreds models sourced from the HuggingFace API, stored in `data/hf_models.json` and embedded at compile time. Memory requirements are computed from parameter counts across a quantization hierarchy (Q8_0 through Q2_K). VRAM is the primary constraint for GPU inference; system RAM is the fallback for CPU-only execution.
 
    **MoE support** -- Models with Mixture-of-Experts architectures (Mixtral, DeepSeek-V2/V3) are detected automatically. Only a subset of experts is active per token, so the effective VRAM requirement is much lower than total parameter count suggests. For example, Mixtral 8x7B has 46.7B total parameters but only activates ~12.9B per token, reducing VRAM from 23.9 GB to ~6.6 GB with expert offloading.
 
@@ -201,7 +254,15 @@ llmfit recommend --json  # Top 5 recommendations (JSON is default for recommend)
 
    Dimensions are combined into a weighted composite score. Weights vary by use-case category (General, Coding, Reasoning, Chat, Multimodal, Embedding). For example, Chat weights Speed higher (0.35) while Reasoning weights Quality higher (0.55). Models are ranked by composite score, with unrunnable models (Too Tight) always at the bottom.
 
-5. **Speed estimation** -- Estimated tokens per second using backend-specific constants:
+5. **Speed estimation** -- Token generation in LLM inference is memory-bandwidth-bound: each token requires reading the full model weights once from VRAM. When the GPU model is recognized, llmfit uses its actual memory bandwidth to estimate throughput:
+
+   Formula: `(bandwidth_GB_s / model_size_GB) × efficiency_factor`
+
+   The efficiency factor (0.55) accounts for kernel overhead, KV-cache reads, and memory controller effects. This approach is validated against published benchmarks from llama.cpp ([Apple Silicon](https://github.com/ggml-org/llama.cpp/discussions/4167), [NVIDIA T4](https://github.com/ggml-org/llama.cpp/discussions/4225)) and real-world measurements.
+
+   The bandwidth lookup table covers ~80 GPUs across NVIDIA (consumer + datacenter), AMD (RDNA + CDNA), and Apple Silicon families.
+
+   For unrecognized GPUs, llmfit falls back to per-backend speed constants:
 
    | Backend | Speed constant |
    |---|---|
@@ -211,8 +272,9 @@ llmfit recommend --json  # Top 5 recommendations (JSON is default for recommend)
    | SYCL | 100 |
    | CPU (ARM) | 90 |
    | CPU (x86) | 70 |
+   | NPU (Ascend) | 390 |
 
-   Formula: `K / params_b × quant_speed_multiplier`, with penalties for CPU offload (0.5×), CPU-only (0.3×), and MoE expert switching (0.8×).
+   Fallback formula: `K / params_b × quant_speed_multiplier`, with penalties for CPU offload (0.5×), CPU-only (0.3×), and MoE expert switching (0.8×).
 
 6. **Fit analysis** -- Each model is evaluated for memory compatibility:
 
@@ -248,7 +310,7 @@ Downloading a model via Ollama integration
 
 ## Model database
 
-The model list is generated by `scripts/scrape_hf_models.py`, a standalone Python script (stdlib only, no pip dependencies) that queries the HuggingFace REST API. 206 models across 57 providers including Meta Llama, Mistral, Qwen, Google Gemma, Microsoft Phi, DeepSeek, IBM Granite, Allen Institute OLMo, xAI Grok, Cohere, BigCode, 01.ai, Upstage, TII Falcon, HuggingFace, Zhipu GLM, Moonshot Kimi, Baidu ERNIE, and more. The scraper automatically detects MoE architectures via model config (`num_local_experts`, `num_experts_per_tok`) and known architecture mappings.
+The model list is generated by `scripts/scrape_hf_models.py`, a standalone Python script (stdlib only, no pip dependencies) that queries the HuggingFace REST API. Hundreds models & providers including Meta Llama, Mistral, Qwen, Google Gemma, Microsoft Phi, DeepSeek, IBM Granite, Allen Institute OLMo, xAI Grok, Cohere, BigCode, 01.ai, Upstage, TII Falcon, HuggingFace, Zhipu GLM, Moonshot Kimi, Baidu ERNIE, and more. The scraper automatically detects MoE architectures via model config (`num_local_experts`, `num_experts_per_tok`) and known architecture mappings.
 
 Model categories span general purpose, coding (CodeLlama, StarCoder2, WizardCoder, Qwen2.5-Coder, Qwen3-Coder), reasoning (DeepSeek-R1, Orca-2), multimodal/vision (Llama 3.2 Vision, Llama 4 Scout/Maverick, Qwen2.5-VL), chat, enterprise (IBM Granite), and embedding (nomic-embed, bge).
 
@@ -270,6 +332,8 @@ cargo build --release
 
 The scraper writes `data/hf_models.json`, which is baked into the binary via `include_str!`. The automated update script backs up existing data, validates JSON output, and rebuilds the binary.
 
+By default, the scraper enriches models with known GGUF download sources from providers like [unsloth](https://huggingface.co/unsloth) and [bartowski](https://huggingface.co/bartowski). Results are cached in `data/gguf_sources_cache.json` (7-day TTL) to avoid repeated API calls. Use `--no-gguf-sources` to skip enrichment for a faster scrape.
+
 ---
 
 ## Project structure
@@ -280,7 +344,7 @@ src/
   hardware.rs     -- System RAM/CPU/GPU detection (multi-GPU, backend identification)
   models.rs       -- Model database, quantization hierarchy, dynamic quant selection
   fit.rs          -- Multi-dimensional scoring (Q/S/F/C), speed estimation, MoE offloading
-  providers.rs    -- Runtime provider integration (Ollama), model install detection, pull/download
+  providers.rs    -- Runtime provider integration (Ollama, llama.cpp, MLX), install detection, pull/download
   display.rs      -- Classic CLI table rendering + JSON output
   tui_app.rs      -- TUI application state, filters, navigation
   tui_ui.rs       -- TUI rendering (ratatui)
@@ -344,13 +408,23 @@ cargo publish
 | `serde` / `serde_json` | JSON deserialization for model database |
 | `tabled` | CLI table formatting |
 | `colored` | CLI colored output |
-| `ureq` | HTTP client for Ollama API integration |
+| `ureq` | HTTP client for runtime/provider API integration |
 | `ratatui` | Terminal UI framework |
 | `crossterm` | Terminal input/output backend for ratatui |
 
 ---
 
-## Ollama integration
+## Runtime provider integration
+
+llmfit supports multiple local runtime providers:
+
+- **Ollama** (daemon/API based pulls)
+- **llama.cpp** (direct GGUF downloads from Hugging Face + local cache detection)
+- **MLX** (Apple Silicon / mlx-community model cache + optional server)
+
+When more than one compatible provider is available for a model, pressing `d` in the TUI opens a provider picker modal.
+
+### Ollama integration
 
 llmfit integrates with [Ollama](https://ollama.com) to detect which models you already have installed and to download new ones directly from the TUI.
 
@@ -387,7 +461,22 @@ On startup, llmfit queries `GET /api/tags` to list your installed Ollama models.
 
 When you press `d` on a model, llmfit sends `POST /api/pull` to Ollama to download it. The row highlights with an animated progress indicator showing download progress in real-time. Once complete, the model is immediately available for use with Ollama.
 
-If Ollama is not running, the `d`, `i`, and `r` keybindings are hidden from the status bar and disabled — the TUI works normally without Ollama, you just can't see install status or pull models.
+If Ollama is not running, Ollama-specific operations are skipped; the TUI still supports other providers like llama.cpp where available.
+
+### llama.cpp integration
+
+llmfit integrates with [llama.cpp](https://github.com/ggml-org/llama.cpp) as a runtime/download provider in both TUI and CLI.
+
+Requirements:
+
+- `llama-cli` or `llama-server` available in `PATH` (for runtime detection)
+- network access to Hugging Face for GGUF downloads
+
+How it works:
+
+- llmfit maps HF models to known GGUF repos (with heuristic fallbacks)
+- downloads GGUF files into the local llama.cpp model cache
+- marks models installed when matching GGUF files are present locally
 
 ### Model name mapping
 
@@ -397,7 +486,7 @@ llmfit's database uses HuggingFace model names (e.g. `Qwen/Qwen2.5-Coder-14B-Ins
 
 ## Platform support
 
-- **Linux** -- Full support. GPU detection via `nvidia-smi` (NVIDIA), `rocm-smi` (AMD), and sysfs/`lspci` (Intel Arc).
+- **Linux** -- Full support. GPU detection via `nvidia-smi` (NVIDIA), `rocm-smi` (AMD), sysfs/`lspci` (Intel Arc) and `npu-smi` (Ascend).
 - **macOS (Apple Silicon)** -- Full support. Detects unified memory via `system_profiler`. VRAM = system RAM (shared pool). Models run via Metal GPU acceleration.
 - **macOS (Intel)** -- RAM and CPU detection works. Discrete GPU detection if `nvidia-smi` available.
 - **Windows** -- RAM and CPU detection works. NVIDIA GPU detection via `nvidia-smi` if installed.
@@ -411,6 +500,7 @@ llmfit's database uses HuggingFace model names (e.g. `Qwen/Qwen2.5-Coder-14B-Ins
 | Intel Arc (discrete) | sysfs (`mem_info_vram_total`) | Exact dedicated VRAM |
 | Intel Arc (integrated) | `lspci` | Shared system memory |
 | Apple Silicon | `system_profiler` | Unified memory (= system RAM) |
+| Ascend | `npu-smi` | Detected (VRAM may be unknown) |
 
 If autodetection fails or reports incorrect values, use `--memory=<SIZE>` to override (see [GPU memory override](#gpu-memory-override) above).
 

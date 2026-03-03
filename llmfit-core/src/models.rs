@@ -40,6 +40,23 @@ pub fn quant_speed_multiplier(quant: &str) -> f64 {
     }
 }
 
+/// Bytes per parameter for a given quantization format.
+/// Used by the bandwidth-based tok/s estimator to compute model size in GB.
+pub fn quant_bytes_per_param(quant: &str) -> f64 {
+    match quant {
+        "F16" | "BF16" => 2.0,
+        "Q8_0" => 1.0,
+        "Q6_K" => 0.75,
+        "Q5_K_M" => 0.625,
+        "Q4_K_M" | "Q4_0" => 0.5,
+        "Q3_K_M" => 0.375,
+        "Q2_K" => 0.25,
+        "mlx-4bit" => 0.5,
+        "mlx-8bit" => 1.0,
+        _ => 0.5, // default to ~4-bit
+    }
+}
+
 /// Quality penalty for quantization (lower quant = lower quality).
 pub fn quant_quality_penalty(quant: &str) -> f64 {
     match quant {
@@ -126,9 +143,29 @@ pub struct LlmModel {
     pub active_parameters: Option<u64>,
     #[serde(default)]
     pub release_date: Option<String>,
+    /// Known GGUF download sources (e.g. unsloth, bartowski repos on HuggingFace)
+    #[serde(default)]
+    pub gguf_sources: Vec<GgufSource>,
+}
+
+/// A known GGUF download source for a model on HuggingFace.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GgufSource {
+    /// HuggingFace repo ID (e.g. "unsloth/Llama-3.1-8B-Instruct-GGUF")
+    pub repo: String,
+    /// Provider who published the GGUF (e.g. "unsloth", "bartowski")
+    pub provider: String,
 }
 
 impl LlmModel {
+    /// MLX models are Apple-only — they won't run on NVIDIA/AMD/Intel hardware.
+    /// We detect them by the `-MLX-` suffix that's standard on HuggingFace
+    /// (e.g. `Qwen3-8B-MLX-4bit`, `LFM2-1.2B-MLX-8bit`).
+    pub fn is_mlx_model(&self) -> bool {
+        let name_lower = self.name.to_lowercase();
+        name_lower.contains("-mlx-") || name_lower.ends_with("-mlx")
+    }
+
     /// Bytes-per-parameter for the model's quantization level.
     fn quant_bpp(&self) -> f64 {
         quant_bpp(&self.quantization)
@@ -209,6 +246,12 @@ impl LlmModel {
         Some((size_gb * 1.1).max(0.5))
     }
 
+    /// Returns true if this model is MLX-specific (Apple Silicon only).
+    /// MLX models are identified by having "-MLX" in their name.
+    pub fn is_mlx_only(&self) -> bool {
+        self.name.to_uppercase().contains("-MLX")
+    }
+
     /// For MoE models, compute RAM needed for offloaded (inactive) experts.
     /// Returns None for dense models.
     pub fn moe_offloaded_ram_gb(&self) -> Option<f64> {
@@ -251,6 +294,8 @@ struct HfModelEntry {
     active_parameters: Option<u64>,
     #[serde(default)]
     release_date: Option<String>,
+    #[serde(default)]
+    gguf_sources: Vec<GgufSource>,
 }
 
 const HF_MODELS_JSON: &str = include_str!("../data/hf_models.json");
@@ -288,6 +333,7 @@ impl ModelDatabase {
                 active_experts: e.active_experts,
                 active_parameters: e.active_parameters,
                 release_date: e.release_date,
+                gguf_sources: e.gguf_sources,
             })
             .collect();
 
@@ -379,6 +425,7 @@ mod tests {
             active_experts: None,
             active_parameters: None,
             release_date: None,
+            gguf_sources: vec![],
         };
 
         // Large budget should return mlx-8bit (best in MLX hierarchy)
@@ -447,6 +494,7 @@ mod tests {
             active_experts: None,
             active_parameters: None,
             release_date: None,
+            gguf_sources: vec![],
         };
         assert_eq!(model.params_b(), 7.0);
     }
@@ -469,6 +517,7 @@ mod tests {
             active_experts: None,
             active_parameters: None,
             release_date: None,
+            gguf_sources: vec![],
         };
         assert_eq!(model.params_b(), 13.0);
     }
@@ -491,6 +540,7 @@ mod tests {
             active_experts: None,
             active_parameters: None,
             release_date: None,
+            gguf_sources: vec![],
         };
         assert_eq!(model.params_b(), 0.5);
     }
@@ -513,6 +563,7 @@ mod tests {
             active_experts: None,
             active_parameters: None,
             release_date: None,
+            gguf_sources: vec![],
         };
 
         let mem = model.estimate_memory_gb("Q4_K_M", 4096);
@@ -543,6 +594,7 @@ mod tests {
             active_experts: None,
             active_parameters: None,
             release_date: None,
+            gguf_sources: vec![],
         };
 
         // Large budget should return best quant
@@ -579,6 +631,7 @@ mod tests {
             active_experts: None,
             active_parameters: None,
             release_date: None,
+            gguf_sources: vec![],
         };
         assert!(dense_model.moe_active_vram_gb().is_none());
 
@@ -599,6 +652,7 @@ mod tests {
             active_experts: Some(2),
             active_parameters: Some(12_900_000_000),
             release_date: None,
+            gguf_sources: vec![],
         };
         let vram = moe_model.moe_active_vram_gb();
         assert!(vram.is_some());
@@ -627,6 +681,7 @@ mod tests {
             active_experts: None,
             active_parameters: None,
             release_date: None,
+            gguf_sources: vec![],
         };
         assert!(dense_model.moe_offloaded_ram_gb().is_none());
 
@@ -647,6 +702,7 @@ mod tests {
             active_experts: Some(2),
             active_parameters: Some(12_900_000_000),
             release_date: None,
+            gguf_sources: vec![],
         };
         let offloaded = moe_model.moe_offloaded_ram_gb();
         assert!(offloaded.is_some());
@@ -677,6 +733,7 @@ mod tests {
             active_experts: None,
             active_parameters: None,
             release_date: None,
+            gguf_sources: vec![],
         };
         assert_eq!(UseCase::from_model(&model), UseCase::Coding);
     }
@@ -699,6 +756,7 @@ mod tests {
             active_experts: None,
             active_parameters: None,
             release_date: None,
+            gguf_sources: vec![],
         };
         assert_eq!(UseCase::from_model(&model), UseCase::Embedding);
     }
@@ -721,6 +779,7 @@ mod tests {
             active_experts: None,
             active_parameters: None,
             release_date: None,
+            gguf_sources: vec![],
         };
         assert_eq!(UseCase::from_model(&model), UseCase::Reasoning);
     }
