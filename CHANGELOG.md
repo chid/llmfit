@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Features
+
+* add `--ram` flag to override available system RAM while keeping `--memory` for GPU VRAM override
+* wire RAM/VRAM overrides through TUI, CLI mode, and subcommands
+
 ## [0.3.7](https://github.com/AlexsJones/llmfit/compare/v0.3.6...v0.3.7) (2026-02-21)
 
 
